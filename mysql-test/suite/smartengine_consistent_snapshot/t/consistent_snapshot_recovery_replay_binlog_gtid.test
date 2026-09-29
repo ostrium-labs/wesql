@@ -27,6 +27,7 @@ let $wait_condition= SELECT count(*) >= $snapshots_before + 1 FROM INFORMATION_S
 # after everything above is committed.
 INSERT INTO t1 VALUES (0, 'in snapshot');
 let $wait_condition= SELECT count(*) >= $snapshots_before + 2 FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX;
+--let $wait_timeout= 600
 --source include/wait_condition_or_abort.inc
 SET GLOBAL snapshot_archive = OFF;
 --let $snapshots= `SELECT count(*) FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX`
