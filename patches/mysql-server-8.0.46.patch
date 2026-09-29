@@ -2131,7 +2131,7 @@ index 5d3e0b8b..02d84957 100644
  /**
    Prints a printf style message to the error log.
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
-index c8a7d00b..beb5f4d3 100644
+index c8a7d00b..02abc841 100644
 --- a/sql/mysqld.cc
 +++ b/sql/mysqld.cc
 @@ -774,15 +774,19 @@ MySQL clients support the protocol:
@@ -2541,7 +2541,45 @@ index c8a7d00b..beb5f4d3 100644
      {nullptr, 0, nullptr, nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG, 0, 0,
       0, nullptr, 0, nullptr}};
  
-@@ -11249,6 +11503,11 @@ static void set_server_version(void) {
+@@ -9317,6 +9571,26 @@ static int show_queries(THD *thd, SHOW_VAR *var, char *) {
+   return 0;
+ }
+ 
++#ifdef WESQL
++/*
++  Wesql_ready_for_write: ON when client writes are accepted and, when the
++  binlog archive is expected to run (serverless, log_bin and binlog_archive
++  all ON), the thread that ships committed binlog to the object store is
++  running. Object store recovery finishes before mysqld serves any client
++  connection, so a session that can read this variable is past recovery.
++  Readiness probes should wait for ON.
++*/
++static int show_wesql_ready_for_write(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_MY_BOOL;
++  var->value = buff;
++  bool ready = mysqld_server_started && !opt_readonly && !opt_super_readonly;
++  if (ready && opt_serverless && opt_bin_log && opt_binlog_archive)
++    ready = Binlog_archive::get_instance()->is_thread_running();
++  *(reinterpret_cast<bool *>(buff)) = ready;
++  return 0;
++}
++#endif
++
+ static int show_net_compression(THD *thd, SHOW_VAR *var, char *buff) {
+   var->type = SHOW_MY_BOOL;
+   var->value = buff;
+@@ -10017,6 +10291,10 @@ SHOW_VAR status_vars[] = {
+     {"Threads_running", (char *)&show_num_thread_running, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
+     {"Uptime", (char *)&show_starttime, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++#ifdef WESQL
++    {"Wesql_ready_for_write", (char *)&show_wesql_ready_for_write, SHOW_FUNC,
++     SHOW_SCOPE_GLOBAL},
++#endif
+ #ifdef ENABLED_PROFILING
+     {"Uptime_since_flush_status", (char *)&show_flushstatustime, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
+@@ -11249,6 +11527,11 @@ static void set_server_version(void) {
  #ifndef NDEBUG
    if (!strstr(MYSQL_SERVER_SUFFIX_STR, "-debug"))
      end = my_stpcpy(end, "-debug");
@@ -2553,7 +2591,7 @@ index c8a7d00b..beb5f4d3 100644
  #endif
  #ifdef HAVE_VALGRIND
    if (SERVER_VERSION_LENGTH - (end - server_version) >
-@@ -11948,7 +12207,7 @@ static PSI_mutex_info all_server_mutexes[]=
+@@ -11948,7 +12231,7 @@ static PSI_mutex_info all_server_mutexes[]=
    { &key_monitor_info_run_lock, "Source_IO_monitor::run_lock", 0, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_delegate_connection_mutex, "LOCK_delegate_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_group_replication_connection_mutex, "LOCK_group_replication_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
