@@ -24,6 +24,7 @@
 
 #include "sql/consistent_recovery.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -462,7 +463,16 @@ int Consistent_recovery::recovery_consistent_snapshot(int flags) {
   if ((read_consistent_snapshot_recovery_status(recovery_status) == 0) &&
       (recovery_status.m_recovery_status >=
        CONSISTENT_SNAPSHOT_RECOVERY_STAGE_DATA_READY)) {
-    if (std::ifstream(binlog_replay_marker_name()).good()) {
+    std::error_code marker_ec;
+    const bool marker_exists =
+        std::filesystem::exists(binlog_replay_marker_name(), marker_ec);
+    if (marker_ec) {
+      // Cannot tell whether the replay finished: fail closed.
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "Cannot check whether the binlog replay marker file exists.");
+      return 1;
+    }
+    if (marker_exists) {
       // The replay of the binlog written after the snapshot did not finish
       // (crash or failure). The engines hold an unknown part of it, and the
       // replay cannot resume, so do not serve a partly recovered instance.
