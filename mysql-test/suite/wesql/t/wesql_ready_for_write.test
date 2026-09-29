@@ -1,0 +1,19 @@
+# Wesql_ready_for_write reports whether the server takes writes that the
+# binlog archive ships to the object store (upstream issue wesql/wesql#98).
+
+--echo # A started server that is not read-only is ready.
+SHOW GLOBAL STATUS LIKE 'Wesql_ready_for_write';
+SELECT VARIABLE_VALUE FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'Wesql_ready_for_write';
+
+--echo # read_only and super_read_only make it not ready.
+SET GLOBAL read_only = ON;
+SHOW GLOBAL STATUS LIKE 'Wesql_ready_for_write';
+SET GLOBAL read_only = OFF;
+SHOW GLOBAL STATUS LIKE 'Wesql_ready_for_write';
+
+SET GLOBAL super_read_only = ON;
+SHOW GLOBAL STATUS LIKE 'Wesql_ready_for_write';
+SET GLOBAL super_read_only = OFF;
+SET GLOBAL read_only = OFF;
+SHOW GLOBAL STATUS LIKE 'Wesql_ready_for_write';
