@@ -1,0 +1,29 @@
+# objectstore_use_path_style chooses virtual-hosted-style or path-style
+# addressing for the S3 client (upstream issue wesql/wesql#97).
+# It is a read-only, global, command-line option: OFF, ON or AUTO.
+
+--echo # Default is AUTO.
+SELECT @@global.objectstore_use_path_style;
+
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SELECT @@session.objectstore_use_path_style;
+
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SET GLOBAL objectstore_use_path_style = ON;
+
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+  FROM performance_schema.global_variables
+  WHERE VARIABLE_NAME = 'objectstore_use_path_style';
+
+--echo # The option accepts ON, OFF and AUTO on the command line.
+--let $restart_parameters = restart: --objectstore-use-path-style=ON
+--source include/restart_mysqld.inc
+SELECT @@global.objectstore_use_path_style;
+
+--let $restart_parameters = restart: --objectstore-use-path-style=OFF
+--source include/restart_mysqld.inc
+SELECT @@global.objectstore_use_path_style;
+
+--let $restart_parameters = restart:
+--source include/restart_mysqld.inc
+SELECT @@global.objectstore_use_path_style;
