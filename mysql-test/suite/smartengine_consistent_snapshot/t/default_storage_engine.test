@@ -1,3 +1,12 @@
+--perl
+my $n = 0;
+if (open(my $f, "<", "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err")) {
+  while (<$f>) { $n++ if /WeSQL serverless: connection [0-9]+ asked for ENGINE=INNODB; the table uses SMARTENGINE instead/; }
+}
+open(my $o, ">", "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt") or die;
+print $o "$n\n";
+close $o;
+EOF
 --disable_warnings
 DROP TABLE IF EXISTS t1;
 --enable_warnings
@@ -32,6 +41,61 @@ SET GLOBAL default_storage_engine = INNODB;
 CREATE TABLE t1 (c1 int primary key, c2 int);
 SHOW CREATE TABLE t1;
 DROP TABLE t1;
+
+## serverless_honor_innodb_engine keeps explicit ENGINE=InnoDB tables on
+## InnoDB, with enforced foreign keys (upstream issue wesql/wesql#96).
+SELECT @@global.serverless_honor_innodb_engine;
+--error ER_GLOBAL_VARIABLE
+SET SESSION serverless_honor_innodb_engine = ON;
+SET GLOBAL serverless_honor_innodb_engine = ON;
+
+CREATE TABLE parent (id INT PRIMARY KEY) ENGINE = INNODB;
+CREATE TABLE child (id INT PRIMARY KEY, pid INT,
+  CONSTRAINT fk_child_parent FOREIGN KEY (pid) REFERENCES parent (id)
+  ON DELETE CASCADE) ENGINE = INNODB;
+SHOW CREATE TABLE parent;
+SHOW CREATE TABLE child;
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO child VALUES (1, 1);
+INSERT INTO parent VALUES (1);
+INSERT INTO child VALUES (1, 1);
+DELETE FROM parent WHERE id = 1;
+SELECT COUNT(*) FROM child;
+
+## Tables without an ENGINE clause still use SMARTENGINE.
+CREATE TABLE t1 (c1 int primary key, c2 int);
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+
+## ALTER TABLE ... ENGINE = INNODB is kept as well.
+ALTER TABLE t1 ENGINE = INNODB;
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+
+## Other engines are still replaced, with a warning.
+CREATE TABLE t2 (c1 int primary key) ENGINE = MYISAM;
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't2';
+
+DROP TABLE child, parent, t1, t2;
+
+## With the option OFF, ENGINE = INNODB is replaced again.
+SET GLOBAL serverless_honor_innodb_engine = OFF;
+CREATE TABLE t1 (c1 int primary key, c2 int) ENGINE = INNODB;
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+DROP TABLE t1;
+
+## Substitutions are also written to the error log.
+--perl
+my $base = 0;
+if (open(my $b, "<", "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt")) { $base = <$b> + 0; close $b; }
+my $n = 0;
+open(my $f, "<", "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err") or die;
+while (<$f>) { $n++ if /WeSQL serverless: connection [0-9]+ asked for ENGINE=INNODB; the table uses SMARTENGINE instead/; }
+unlink "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt";
+print "Engine substitutions logged by this test: ", $n - $base, "\n";
+EOF
 
 --source suite/smartengine/include/check_smartengine_log_error.inc
 
