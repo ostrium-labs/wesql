@@ -10,7 +10,7 @@ t1	CREATE TABLE `t1` (
 DROP TABLE t1;
 CREATE TABLE t1 (c1 int primary key, c2 int) ENGINE = INNODB;
 Warnings:
-Warning	7513	Force change storage engine from INNODB to smartengine in serveless mode
+Warning	7501	Force change storage engine from INNODB to smartengine in serveless mode
 SHOW CREATE TABLE t1;
 Table	Create Table
 t1	CREATE TABLE `t1` (
@@ -26,7 +26,7 @@ Variable_name	Value
 default_storage_engine	SMARTENGINE
 SET default_storage_engine = INNODB;
 Warnings:
-Warning	7513	Force change default storage engine from INNODB to smartengine in serveless mode
+Warning	7501	Force change default storage engine from INNODB to smartengine in serveless mode
 CREATE TABLE t1 (c1 int primary key, c2 int);
 SHOW CREATE TABLE t1;
 Table	Create Table
@@ -38,7 +38,7 @@ t1	CREATE TABLE `t1` (
 DROP TABLE t1;
 SET GLOBAL default_storage_engine = INNODB;
 Warnings:
-Warning	7513	Force change default storage engine from INNODB to smartengine in serveless mode
+Warning	7501	Force change default storage engine from INNODB to smartengine in serveless mode
 CREATE TABLE t1 (c1 int primary key, c2 int);
 SHOW CREATE TABLE t1;
 Table	Create Table
@@ -48,3 +48,64 @@ t1	CREATE TABLE `t1` (
   PRIMARY KEY (`c1`)
 ) ENGINE=SMARTENGINE DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
 DROP TABLE t1;
+SELECT @@global.serverless_honor_innodb_engine;
+@@global.serverless_honor_innodb_engine
+0
+SET SESSION serverless_honor_innodb_engine = ON;
+ERROR HY000: Variable 'serverless_honor_innodb_engine' is a GLOBAL variable and should be set with SET GLOBAL
+SET GLOBAL serverless_honor_innodb_engine = ON;
+CREATE TABLE parent (id INT PRIMARY KEY) ENGINE = INNODB;
+CREATE TABLE child (id INT PRIMARY KEY, pid INT,
+CONSTRAINT fk_child_parent FOREIGN KEY (pid) REFERENCES parent (id)
+ON DELETE CASCADE) ENGINE = INNODB;
+SHOW CREATE TABLE parent;
+Table	Create Table
+parent	CREATE TABLE `parent` (
+  `id` int NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SHOW CREATE TABLE child;
+Table	Create Table
+child	CREATE TABLE `child` (
+  `id` int NOT NULL,
+  `pid` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `fk_child_parent` (`pid`),
+  CONSTRAINT `fk_child_parent` FOREIGN KEY (`pid`) REFERENCES `parent` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+INSERT INTO child VALUES (1, 1);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`test`.`child`, CONSTRAINT `fk_child_parent` FOREIGN KEY (`pid`) REFERENCES `parent` (`id`) ON DELETE CASCADE)
+INSERT INTO parent VALUES (1);
+INSERT INTO child VALUES (1, 1);
+DELETE FROM parent WHERE id = 1;
+SELECT COUNT(*) FROM child;
+COUNT(*)
+0
+CREATE TABLE t1 (c1 int primary key, c2 int);
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+ENGINE
+SMARTENGINE
+ALTER TABLE t1 ENGINE = INNODB;
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+ENGINE
+InnoDB
+CREATE TABLE t2 (c1 int primary key) ENGINE = MYISAM;
+Warnings:
+Warning	7501	Force change storage engine from MYISAM to smartengine in serveless mode
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't2';
+ENGINE
+SMARTENGINE
+DROP TABLE child, parent, t1, t2;
+SET GLOBAL serverless_honor_innodb_engine = OFF;
+CREATE TABLE t1 (c1 int primary key, c2 int) ENGINE = INNODB;
+Warnings:
+Warning	7501	Force change storage engine from INNODB to smartengine in serveless mode
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
+ENGINE
+SMARTENGINE
+DROP TABLE t1;
+Engine substitutions logged by this test: 3

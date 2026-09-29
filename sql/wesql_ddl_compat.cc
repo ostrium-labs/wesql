@@ -155,6 +155,26 @@ void strip_foreign_keys(THD *thd, Alter_info *alter_info) {
 
 }  // namespace
 
+bool opt_serverless_honor_innodb_engine = false;
+
+bool wesql_serverless_keeps_engine(const LEX_CSTRING &engine) {
+  if (!opt_serverless_honor_innodb_engine || engine.str == nullptr)
+    return false;
+  static const LEX_CSTRING innodb = {STRING_WITH_LEN("InnoDB")};
+  return engine.length == innodb.length &&
+         native_strncasecmp(engine.str, innodb.str, innodb.length) == 0;
+}
+
+void wesql_log_engine_substitution(THD *thd, const LEX_CSTRING &engine) {
+  sql_print_warning(
+      "WeSQL serverless: connection %u asked for ENGINE=%.*s; the table uses "
+      "SMARTENGINE instead (serverless mode stores user tables in "
+      "SmartEngine). Set serverless_honor_innodb_engine=ON to keep explicit "
+      "ENGINE=InnoDB tables on InnoDB.",
+      thd != nullptr ? thd->thread_id() : 0, static_cast<int>(engine.length),
+      engine.str);
+}
+
 bool wesql_is_smartengine_create(const HA_CREATE_INFO *create_info) {
   return create_info != nullptr && create_info->db_type != nullptr &&
          create_info->db_type->db_type == DB_TYPE_SMARTENGINE;
