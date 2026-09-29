@@ -307,7 +307,8 @@ ObjectStore *create_object_store(const std::string_view &provider,
                                  const std::string_view *endpoint,
                                  bool use_https, std::string &err_msg) {
   if (ObjectStore::use_s3_sdk(provider)) {
-    return create_s3_objstore(region, endpoint, use_https, err_msg);
+    return create_s3_objstore(provider, region, endpoint, use_https,
+                              err_msg);
   } else if (provider == "aliyun") {
     return create_aliyun_oss_objstore(region, endpoint, err_msg);
   } else if (provider == "local") {
@@ -322,7 +323,8 @@ ObjectStore *create_source_object_store(const std::string_view &provider,
                                         const std::string_view *endpoint,
                                         bool use_https, std::string &err_msg) {
   if (ObjectStore::use_s3_sdk(provider)) {
-    return create_source_s3_objstore(region, endpoint, use_https, err_msg);
+    return create_source_s3_objstore(provider, region, endpoint, use_https,
+                                     err_msg);
   } else if (provider == "aliyun") {
     return create_source_aliyun_oss_objstore(region, endpoint, err_msg);
   } else if (provider == "local") {
@@ -337,7 +339,8 @@ ObjectStore *create_dest_object_store(const std::string_view &provider,
                                       const std::string_view *endpoint,
                                       bool use_https, std::string &err_msg) {
   if (ObjectStore::use_s3_sdk(provider)) {
-    return create_dest_s3_objstore(region, endpoint, use_https, err_msg);
+    return create_dest_s3_objstore(provider, region, endpoint, use_https,
+                                   err_msg);
   } else if (provider == "aliyun") {
     return create_dest_aliyun_oss_objstore(region, endpoint, err_msg);
   } else if (provider == "local") {
