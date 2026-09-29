@@ -24,6 +24,7 @@
 
 #include "sql/consistent_recovery.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -49,6 +50,18 @@
 #include "sql/sql_plugin.h"
 #include "sql/sql_show.h"
 #include "sql/sys_vars_shared.h"
+#include "sql/binlog_reader.h"
+#include "sql/log_event.h"
+#include "sql/protocol_classic.h"
+#include "sql/rpl_gtid.h"
+#include "sql/rpl_mi.h"
+#include "sql/rpl_msr.h"
+#include "sql/rpl_rli.h"
+#include "sql/sql_class.h"
+
+#include <algorithm>
+#include <chrono>
+#include <thread>
 
 Consistent_recovery consistent_recovery;
 static int copy_directory(const std::string &from, const std::string &to);
@@ -93,6 +106,12 @@ Consistent_recovery::Consistent_recovery()
   m_mysql_clone_keyid[0] = '\0';
   m_mysql_clone_index_file_name[0] = '\0';
   m_se_backup_index_file_name[0] = '\0';
+  m_binlog_replay_pending = false;
+  m_binlog_replay_start_pos = 0;
+  m_binlog_replay_end_pos = 0;
+  m_binlog_replay_until_pos = 0;
+  m_binlog_replay_transactions = 0;
+  m_binlog_replay_gtids = nullptr;
   m_se_snapshot_dir[0] = '\0';
   m_se_backup_keyid[0] = '\0';
   m_mysql_binlog_index_file_name[0] = '\0';
@@ -444,6 +463,25 @@ int Consistent_recovery::recovery_consistent_snapshot(int flags) {
   if ((read_consistent_snapshot_recovery_status(recovery_status) == 0) &&
       (recovery_status.m_recovery_status >=
        CONSISTENT_SNAPSHOT_RECOVERY_STAGE_DATA_READY)) {
+    std::error_code marker_ec;
+    const bool marker_exists =
+        std::filesystem::exists(binlog_replay_marker_name(), marker_ec);
+    if (marker_ec) {
+      // Cannot tell whether the replay finished: fail closed.
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "Cannot check whether the binlog replay marker file exists.");
+      return 1;
+    }
+    if (marker_exists) {
+      // The replay of the binlog written after the snapshot did not finish
+      // (crash or failure). The engines hold an unknown part of it, and the
+      // replay cannot resume, so do not serve a partly recovered instance.
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "The replay of the binlog written after the snapshot was "
+             "interrupted. Remove the data directory to recover again from "
+             "the object store.");
+      return 1;
+    }
     LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
            "Recovery data exists already, skip pull data from object store.");
     m_state = CONSISTENT_RECOVERY_STATE_END;
@@ -459,6 +497,7 @@ int Consistent_recovery::recovery_consistent_snapshot(int flags) {
     return 0;
   }
 
+  remove_binlog_replay_marker();
   memset(&recovery_status, 0, sizeof(recovery_status));
   recovery_status.m_recovery_status = CONSISTENT_SNAPSHOT_RECOVERY_STAGE_BEGIN;
   if (write_consistent_snapshot_recovery_status(recovery_status)) {
@@ -1372,6 +1411,7 @@ bool Consistent_recovery::recovery_binlog(const char *binlog_index_name
       close_binlog_index_file(&m_binlog_index_file);
       return true;
     }
+    m_binlog_replay_files.emplace_back(mysql_binlog_full_name);
     // Using mysql binlog full name.
     strmake(m_mysql_binlog_end_file, mysql_binlog_full_name,
             sizeof(m_mysql_binlog_end_file) - 1);
@@ -1400,6 +1440,33 @@ bool Consistent_recovery::recovery_binlog(const char *binlog_index_name
   close_binlog_index_file(&mysql_binlog_index_file);
   close_binlog_index_file(&m_binlog_index_file);
   remove_file(m_binlog_index_file_name);
+
+  // Crash recovery: the engines hold the snapshot, the binlog now reaches the
+  // last archived slice. Everything in between must be applied again
+  // (replay_binlog_after_snapshot()). PITR stops the download at the
+  // snapshot file and continues through the binlog archive replica instead.
+  m_binlog_replay_start_pos =
+      m_binlog_file[0] == '\0'
+          ? BIN_LOG_HEADER_SIZE
+          : std::max<my_off_t>(m_mysql_binlog_pos, BIN_LOG_HEADER_SIZE);
+  m_binlog_replay_end_pos = m_mysql_binlog_end_pos;
+  if (m_recovery_type == CONSISTENT_RECOVERY_REBULD && !opt_initialize &&
+      !opt_recovery_consistent_snapshot_only &&
+      !m_binlog_replay_files.empty() &&
+      (m_binlog_replay_files.size() > 1 ||
+       m_binlog_replay_end_pos > m_binlog_replay_start_pos)) {
+    if (write_binlog_replay_marker()) return 1;
+    m_binlog_replay_pending = true;
+    std::string msg("binlog after the snapshot must be replayed, from ");
+    msg.append(m_binlog_replay_files.front());
+    msg.append(":");
+    msg.append(std::to_string(m_binlog_replay_start_pos));
+    msg.append(" to ");
+    msg.append(m_binlog_replay_files.back());
+    msg.append(":");
+    msg.append(std::to_string(m_binlog_replay_end_pos));
+    LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+  }
 
   /*
   // init database from consistent snapshot.
@@ -1725,7 +1792,6 @@ bool Consistent_recovery::recovery_consistent_snapshot_finish() {
  * @return int
  */
 int Consistent_recovery::consistent_snapshot_consensus_recovery_finish() {
-  std::string file_name;
   if (m_state == CONSISTENT_RECOVERY_STATE_NONE) return 0;
   if (m_state == CONSISTENT_RECOVERY_STATE_END) {
     if (opt_recovery_consistent_snapshot_only) {
@@ -1743,13 +1809,15 @@ int Consistent_recovery::consistent_snapshot_consensus_recovery_finish() {
                "recovey snapshot binlog mismatch old archive end binlog.");
       }
     }
-    convert_dirname(mysql_real_data_home, mysql_real_data_home, NullS);
-    file_name.assign(mysql_real_data_home);
-    file_name.append(CONSISTENT_SNAPSHOT_RECOVERY_FILE);
-    remove_file(file_name);
-    LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
-           "recover persistent snapshot finish and delete "
-           "#status_snapshot_recovery file");
+    // Keep the status file until the binlog replay has finished. The
+    // #status_binlog_replay marker makes a restart after an interrupted
+    // replay fail instead of serving a partly recovered instance.
+    if (m_binlog_replay_pending) {
+      LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "recover persistent snapshot finish, binlog replay pending");
+      return 0;
+    }
+    remove_recovery_status_file();
     return 0;
   }
   return 1;
@@ -2576,4 +2644,462 @@ static inline const char *rpl_make_log_name(PSI_memory_key key, const char *opt,
     return my_strdup(key, buff, MYF(0));
   else
     return nullptr;
+}
+
+/*
+  Replay of the binlog written after the snapshot (upstream issue
+  wesql/wesql#95).
+
+  The single-node server lost the Raft applier that used to apply these
+  transactions after a recovery from the object store. The replay below does
+  the same with a temporary replication channel: the restored binlog is fed
+  into the channel's relay log, and the SQL applier runs up to the end of the
+  last restored transaction.
+
+  - The replayed transactions are already in the binlog (and in the object
+    store), so the channel runs with log_replica_updates=OFF and does not
+    write them again. Their GTIDs were removed from gtid_executed at startup
+    (scan_binlog_replay_window()), and are recorded again as they commit.
+  - The events carry this server's server_id, so the channel sets
+    replicate_same_server_id.
+  - It runs before the binlog and snapshot archive threads start and before
+    client connections are served. A snapshot taken in the middle of the
+    replay would record a binlog position whose data is not in the engines.
+*/
+
+static constexpr const char *kBinlogReplayChannel = "wesql_snapshot_replay";
+
+std::string Consistent_recovery::binlog_replay_marker_name() {
+  std::string file_name;
+  convert_dirname(mysql_real_data_home, mysql_real_data_home, NullS);
+  file_name.assign(mysql_real_data_home);
+  file_name.append(CONSISTENT_BINLOG_REPLAY_FILE);
+  return file_name;
+}
+
+bool Consistent_recovery::write_binlog_replay_marker() {
+  std::ofstream marker(binlog_replay_marker_name());
+  marker << "binlog replay pending\n";
+  marker.flush();
+  if (!marker.good()) {
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "Failed to write the binlog replay marker file.");
+    return true;
+  }
+  return false;
+}
+
+void Consistent_recovery::remove_binlog_replay_marker() {
+  remove_file(binlog_replay_marker_name());
+}
+
+void Consistent_recovery::remove_recovery_status_file() {
+  std::string file_name;
+  convert_dirname(mysql_real_data_home, mysql_real_data_home, NullS);
+  file_name.assign(mysql_real_data_home);
+  file_name.append(CONSISTENT_SNAPSHOT_RECOVERY_FILE);
+  remove_file(file_name);
+  LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+         "recover persistent snapshot finish and delete "
+         "#status_snapshot_recovery file");
+}
+
+static bool is_group_end_event(Log_event *ev) {
+  switch (ev->get_type_code()) {
+    case binary_log::XID_EVENT:
+    case binary_log::XA_PREPARE_LOG_EVENT:
+      return true;
+    case binary_log::QUERY_EVENT: {
+      auto *qev = down_cast<Query_log_event *>(ev);
+      std::string q(qev->query, qev->q_len);
+      std::transform(q.begin(), q.end(), q.begin(), ::toupper);
+      return q != "BEGIN" && q.rfind("XA START", 0) != 0 &&
+             q.rfind("XA END", 0) != 0 && q.rfind("SAVEPOINT", 0) != 0 &&
+             q.rfind("ROLLBACK TO", 0) != 0 &&
+             q.rfind("RELEASE SAVEPOINT", 0) != 0;
+    }
+    default:
+      return false;
+  }
+}
+
+int Consistent_recovery::scan_binlog_replay_window(Gtid_set *gtids) {
+  if (!m_binlog_replay_pending) return 0;
+  m_binlog_replay_transactions = 0;
+  for (size_t i = 0; i < m_binlog_replay_files.size(); i++) {
+    const std::string &file = m_binlog_replay_files[i];
+    Binlog_file_reader reader(opt_source_verify_checksum);
+    if (reader.open(file.c_str(), i == 0 ? m_binlog_replay_start_pos : 0)) {
+      std::string msg("binlog replay: failed to open ");
+      msg.append(file);
+      msg.append(": ");
+      msg.append(reader.get_error_str());
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+      return 1;
+    }
+    Log_event *ev = nullptr;
+    while ((ev = reader.read_event_object()) != nullptr) {
+      if (ev->get_type_code() == binary_log::GTID_LOG_EVENT && gtids) {
+        auto *gev = down_cast<Gtid_log_event *>(ev);
+        global_sid_lock->wrlock();
+        rpl_sidno sidno = gev->get_sidno(false);
+        if (sidno <= 0 || gtids->ensure_sidno(sidno) != RETURN_STATUS_OK) {
+          global_sid_lock->unlock();
+          delete ev;
+          return 1;
+        }
+        gtids->_add_gtid(sidno, gev->get_gno());
+        global_sid_lock->unlock();
+      }
+      if (is_group_end_event(ev)) {
+        m_binlog_replay_transactions++;
+        m_binlog_replay_until_file.assign(file.c_str() +
+                                          dirname_length(file.c_str()));
+        m_binlog_replay_until_pos = ev->common_header->log_pos;
+      }
+      delete ev;
+    }
+    if (reader.has_fatal_error()) {
+      std::string msg("binlog replay: failed to read ");
+      msg.append(file);
+      msg.append(": ");
+      msg.append(reader.get_error_str());
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+      return 1;
+    }
+  }
+  std::string msg("binlog replay: ");
+  msg.append(std::to_string(m_binlog_replay_transactions));
+  msg.append(" transaction(s) after the snapshot");
+  if (m_binlog_replay_transactions > 0) {
+    msg.append(", last one ends at ");
+    msg.append(m_binlog_replay_until_file);
+    msg.append(":");
+    msg.append(std::to_string(m_binlog_replay_until_pos));
+  }
+  LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+  if (m_binlog_replay_transactions == 0) {
+    m_binlog_replay_pending = false;
+    remove_binlog_replay_marker();
+    remove_recovery_status_file();
+  } else if (gtids != nullptr && !gtids->is_empty()) {
+    m_binlog_replay_gtids = new Gtid_set(global_sid_map, global_sid_lock);
+    global_sid_lock->wrlock();
+    m_binlog_replay_gtids->add_gtid_set(gtids);
+    global_sid_lock->unlock();
+  }
+  return 0;
+}
+
+static void calc_replay_event_checksum(uchar *event_ptr, size_t event_len) {
+  ha_checksum crc = checksum_crc32(0L, nullptr, 0);
+  crc = checksum_crc32(crc, event_ptr, event_len - BINLOG_CHECKSUM_LEN);
+  int4store(event_ptr + event_len - BINLOG_CHECKSUM_LEN, crc);
+}
+
+/* A Rotate event that sets the source position, as the IO thread does. */
+static std::string fake_replay_rotate_event(
+    const char *log_file, my_off_t log_pos, ulong event_server_id,
+    binary_log::enum_binlog_checksum_alg alg) {
+  const char *p = log_file + dirname_length(log_file);
+  size_t ident_len = strlen(p);
+  bool with_checksum = alg > binary_log::BINLOG_CHECKSUM_ALG_OFF &&
+                       alg < binary_log::BINLOG_CHECKSUM_ALG_ENUM_END;
+  size_t event_len = ident_len + LOG_EVENT_HEADER_LEN +
+                     Binary_log_event::ROTATE_HEADER_LEN +
+                     (with_checksum ? BINLOG_CHECKSUM_LEN : 0);
+  std::string buf(event_len, '\0');
+  uchar *header = reinterpret_cast<uchar *>(buf.data());
+  uchar *rotate_header = header + LOG_EVENT_HEADER_LEN;
+  int4store(header, 0);
+  header[EVENT_TYPE_OFFSET] = binary_log::ROTATE_EVENT;
+  int4store(header + SERVER_ID_OFFSET, event_server_id);
+  int4store(header + EVENT_LEN_OFFSET, static_cast<uint32>(event_len));
+  int4store(header + LOG_POS_OFFSET, 0);
+  int2store(header + FLAGS_OFFSET, LOG_EVENT_ARTIFICIAL_F);
+  int8store(rotate_header, log_pos);
+  memcpy(rotate_header + Binary_log_event::ROTATE_HEADER_LEN, p, ident_len);
+  if (with_checksum) calc_replay_event_checksum(header, event_len);
+  return buf;
+}
+
+static bool queue_replay_event(Master_info *mi, const char *buf, ulong len) {
+  QUEUE_EVENT_RESULT res = queue_event_from_objstore(mi, buf, len, true);
+  if (res != QUEUE_EVENT_OK) {
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to write an event to the relay log");
+    return true;
+  }
+  return false;
+}
+
+/*
+  Copy the replay window into the channel's relay log. The first file starts
+  in the middle, so it gets a fake Rotate event to the start position and its
+  Format_description event with log_pos=0, like the binlog archive replica
+  relay worker does.
+*/
+int Consistent_recovery::queue_binlog_replay_events(Master_info *mi) {
+  for (size_t i = 0; i < m_binlog_replay_files.size(); i++) {
+    const std::string &file = m_binlog_replay_files[i];
+    const bool first = (i == 0);
+    const my_off_t start_pos = first ? m_binlog_replay_start_pos : 0;
+    Binlog_file_reader reader(false);
+    if (reader.open(file.c_str())) {
+      std::string msg("binlog replay: failed to open ");
+      msg.append(file);
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+      return 1;
+    }
+    unsigned char *data = nullptr;
+    unsigned int length = 0;
+    bool seeked = false;
+    while (!reader.read_event_data(&data, &length)) {
+      char *event_buf = reinterpret_cast<char *>(data);
+      auto type = static_cast<Log_event_type>(event_buf[EVENT_TYPE_OFFSET]);
+      if (type == binary_log::FORMAT_DESCRIPTION_EVENT) {
+        Format_description_log_event fdle(event_buf,
+                                          &reader.format_description_event());
+        reader.set_format_description_event(fdle);
+      }
+      if (first && start_pos > BIN_LOG_HEADER_SIZE && !seeked) {
+        if (type == binary_log::FORMAT_DESCRIPTION_EVENT) {
+          auto alg = Log_event_footer::get_checksum_alg(event_buf, length);
+          std::string rotate = fake_replay_rotate_event(
+              file.c_str(), start_pos, uint4korr(event_buf + SERVER_ID_OFFSET),
+              alg);
+          if (queue_replay_event(mi, rotate.data(), rotate.size())) return 1;
+          uchar *event_ptr = data;
+          event_ptr[FLAGS_OFFSET] &= ~LOG_EVENT_BINLOG_IN_USE_F;
+          // log_pos=0: the replica does not advance the source position.
+          int4store(event_ptr + LOG_POS_OFFSET, 0);
+          int4store(event_ptr + LOG_EVENT_MINIMAL_HEADER_LEN + ST_CREATED_OFFSET,
+                    0);
+          if (alg > binary_log::BINLOG_CHECKSUM_ALG_OFF &&
+              alg < binary_log::BINLOG_CHECKSUM_ALG_ENUM_END)
+            calc_replay_event_checksum(event_ptr, length);
+          if (queue_replay_event(mi, event_buf, length)) return 1;
+          if (reader.seek(start_pos)) {
+            LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+                   "binlog replay: failed to seek to the snapshot position");
+            return 1;
+          }
+          seeked = true;
+        }
+        continue;
+      }
+      if (queue_replay_event(mi, event_buf, length)) return 1;
+    }
+    if (reader.has_fatal_error()) {
+      std::string msg("binlog replay: failed to read ");
+      msg.append(file);
+      msg.append(": ");
+      msg.append(reader.get_error_str());
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int Consistent_recovery::run_binlog_replay(THD *thd) {
+  Master_info *mi = nullptr;
+  std::string msg;
+  int error = 0;
+
+  channel_map.wrlock();
+  mi = channel_map.get_mi(kBinlogReplayChannel);
+  if (mi != nullptr) {
+    // Left over from an interrupted replay.
+    if (reset_slave(thd, mi, true /*reset_all*/)) {
+      channel_map.unlock();
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "binlog replay: failed to remove an old replay channel");
+      return 1;
+    }
+    mi = nullptr;
+  }
+  if (add_new_channel(&mi, kBinlogReplayChannel) ||
+      load_mi_and_rli_from_repositories(mi, false, SLAVE_IO | SLAVE_SQL,
+                                        false, true)) {
+    channel_map.unlock();
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to create the replay channel");
+    return 1;
+  }
+  const std::string &first = m_binlog_replay_files.front();
+  mysql_mutex_lock(mi->rli->relay_log.get_log_lock());
+  mysql_mutex_lock(&mi->data_lock);
+  mi->set_master_log_name(first.c_str() + dirname_length(first.c_str()));
+  mi->set_master_log_pos(m_binlog_replay_start_pos);
+  mi->set_mi_description_event(new Format_description_log_event());
+  mi->get_mi_description_event()->common_footer->checksum_alg =
+      mi->rli->relay_log.relay_log_checksum_alg;
+  error = flush_master_info(mi, true, false);
+  mysql_mutex_unlock(&mi->data_lock);
+  mysql_mutex_unlock(mi->rli->relay_log.get_log_lock());
+  mi->rli->replicate_same_server_id = true;
+  mi->rli->opt_replica_parallel_workers = 0;
+  channel_map.unlock();
+  if (error) {
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to initialize the replay channel");
+    return 1;
+  }
+
+  if (queue_binlog_replay_events(mi)) return 1;
+
+  /*
+    Apply without writing to the binlog again, up to the last transaction.
+    The SQL thread takes OPTION_BIN_LOG from log_replica_updates when it
+    starts, so turn it off only while the thread starts. The applier then
+    runs like a session with sql_log_bin=0. Keeping log_replica_updates=OFF
+    for the whole replay sends DDL with a GTID through the path where the
+    storage engine persists the GTID, which asserts in InnoDB when
+    mysql.gtid_executed is a SmartEngine table.
+  */
+  const bool saved_log_replica_updates = opt_log_replica_updates;
+  opt_log_replica_updates = false;
+  LEX_SLAVE_CONNECTION lex_connection;
+  lex_connection.reset();
+  LEX_MASTER_INFO lex_mi;
+  lex_mi.channel = kBinlogReplayChannel;
+  lex_mi.log_file_name = const_cast<char *>(m_binlog_replay_until_file.c_str());
+  lex_mi.pos = m_binlog_replay_until_pos;
+  channel_map.wrlock();
+  mi->abort_slave = false;
+  mi->rli->abort_slave = false;
+  error = start_slave(thd, &lex_connection, &lex_mi, SLAVE_SQL, mi, false);
+  channel_map.unlock();
+  opt_log_replica_updates = saved_log_replica_updates;
+  if (error) {
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to start the applier");
+    return 1;
+  }
+
+  auto last_report = std::chrono::steady_clock::now();
+  for (;;) {
+    mysql_mutex_lock(&mi->rli->run_lock);
+    const bool running = mi->rli->slave_running;
+    mysql_mutex_unlock(&mi->rli->run_lock);
+    if (!running) break;
+    if (std::chrono::steady_clock::now() - last_report >
+        std::chrono::seconds(10)) {
+      mysql_mutex_lock(&mi->rli->data_lock);
+      msg.assign("binlog replay: applied up to ");
+      msg.append(mi->rli->get_group_master_log_name());
+      msg.append(":");
+      msg.append(std::to_string(mi->rli->get_group_master_log_pos()));
+      mysql_mutex_unlock(&mi->rli->data_lock);
+      LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+      last_report = std::chrono::steady_clock::now();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  mysql_mutex_lock(&mi->rli->data_lock);
+  const uint sql_errno = mi->rli->last_error().number;
+  const std::string applied_file(mi->rli->get_group_master_log_name());
+  const my_off_t applied_pos = mi->rli->get_group_master_log_pos();
+  msg.assign(mi->rli->last_error().message);
+  mysql_mutex_unlock(&mi->rli->data_lock);
+  if (sql_errno != 0 ||
+      compare_log_name(applied_file.c_str(),
+                       m_binlog_replay_until_file.c_str()) != 0 ||
+      applied_pos < m_binlog_replay_until_pos) {
+    std::string err("binlog replay: stopped at ");
+    err.append(applied_file);
+    err.append(":");
+    err.append(std::to_string(applied_pos));
+    err.append(" before ");
+    err.append(m_binlog_replay_until_file);
+    err.append(":");
+    err.append(std::to_string(m_binlog_replay_until_pos));
+    if (sql_errno != 0) {
+      err.append(", error ");
+      err.append(std::to_string(sql_errno));
+      err.append(": ");
+      err.append(msg);
+    }
+    err.append(". The replay channel '");
+    err.append(kBinlogReplayChannel);
+    err.append("' is kept for inspection; the next start recovers again.");
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG, err.c_str());
+    return 1;
+  }
+
+  // The replayed GTIDs are in the binlog, not purged: make sure they did
+  // not end up in gtid_purged.
+  if (m_binlog_replay_gtids != nullptr) {
+    global_sid_lock->wrlock();
+    const_cast<Gtid_set *>(gtid_state->get_lost_gtids())
+        ->remove_gtid_set(m_binlog_replay_gtids);
+    global_sid_lock->unlock();
+  }
+
+  channel_map.wrlock();
+  error = reset_slave(thd, mi, true /*reset_all*/);
+  channel_map.unlock();
+  if (error) {
+    LogErr(WARNING_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to remove the replay channel");
+  }
+  msg.assign("binlog replay: applied ");
+  msg.append(std::to_string(m_binlog_replay_transactions));
+  msg.append(" transaction(s) up to ");
+  msg.append(applied_file);
+  msg.append(":");
+  msg.append(std::to_string(applied_pos));
+  LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
+  return 0;
+}
+
+namespace {
+struct Binlog_replay_thread_arg {
+  Consistent_recovery *recovery;
+  int error;
+};
+
+extern "C" void *binlog_replay_thread(void *p) {
+  auto *arg = static_cast<Binlog_replay_thread_arg *>(p);
+  my_thread_init();
+  THD *thd = new THD;
+  thd->thread_stack = reinterpret_cast<char *>(&thd);
+  thd->set_new_thread_id();
+  thd->store_globals();
+  thd->get_protocol_classic()->init_net(nullptr);
+  thd->system_thread = SYSTEM_THREAD_BACKGROUND;
+  thd->security_context()->skip_grants();
+  arg->error = arg->recovery->run_binlog_replay(thd);
+  thd->release_resources();
+  delete thd;
+  my_thread_end();
+  my_thread_exit(nullptr);
+  return nullptr;
+}
+}  // namespace
+
+int Consistent_recovery::replay_binlog_after_snapshot() {
+  if (!m_binlog_replay_pending) return 0;
+  Binlog_replay_thread_arg arg{this, 1};
+  my_thread_handle handle;
+  my_thread_attr_t attr;
+  my_thread_attr_init(&attr);
+  my_thread_attr_setdetachstate(&attr, MY_THREAD_CREATE_JOINABLE);
+  if (my_thread_create(&handle, &attr, binlog_replay_thread, &arg)) {
+    my_thread_attr_destroy(&attr);
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "binlog replay: failed to create the replay thread");
+    return 1;
+  }
+  my_thread_attr_destroy(&attr);
+  my_thread_join(&handle, nullptr);
+  if (arg.error) return 1;
+  m_binlog_replay_pending = false;
+  delete m_binlog_replay_gtids;
+  m_binlog_replay_gtids = nullptr;
+  remove_binlog_replay_marker();
+  remove_recovery_status_file();
+  return 0;
 }

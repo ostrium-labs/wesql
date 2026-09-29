@@ -1,0 +1,61 @@
+# Turn on GTIDs.
+SET GLOBAL enforce_gtid_consistency = ON;
+SET GLOBAL gtid_mode = OFF_PERMISSIVE;
+SET GLOBAL gtid_mode = ON_PERMISSIVE;
+SET GLOBAL gtid_mode = ON;
+# Wait for a snapshot taken after GTIDs are on, then stop taking snapshots.
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=SMARTENGINE;
+INSERT INTO t1 VALUES (1, 'in snapshot');
+INSERT INTO t1 VALUES (0, 'in snapshot');
+SET GLOBAL snapshot_archive = OFF;
+# Commit after the last snapshot, across a binlog rotation.
+INSERT INTO t1 VALUES (2, 'after snapshot');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'after snapshot, new binlog');
+UPDATE t1 SET v = 'updated after snapshot' WHERE id = 1;
+CREATE TABLE t2 (id INT PRIMARY KEY) ENGINE=SMARTENGINE;
+INSERT INTO t2 VALUES (1), (2);
+# An explicit ENGINE=InnoDB is replaced by SMARTENGINE, also on replay.
+CREATE TABLE t3 (id INT PRIMARY KEY) ENGINE=InnoDB;
+Warnings:
+Warning	7501	Force change storage engine from InnoDB to smartengine in serveless mode
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't3';
+ENGINE
+SMARTENGINE
+SELECT * FROM t1 ORDER BY id;
+id	v
+0	in snapshot
+1	updated after snapshot
+2	after snapshot
+3	after snapshot, new binlog
+# Wait until that binlog is in the object store.
+no_new_snapshot
+1
+# Kill the server and remove its data directory.
+# Kill the server
+# Recover from the object store.
+# restart: --gtid-mode=ON --enforce-gtid-consistency=ON
+SELECT * FROM t1 ORDER BY id;
+id	v
+0	in snapshot
+1	updated after snapshot
+2	after snapshot
+3	after snapshot, new binlog
+SELECT * FROM t2 ORDER BY id;
+id
+1
+2
+SELECT ENGINE FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't3';
+ENGINE
+SMARTENGINE
+include/assert.inc [gtid_executed is the same as before the crash]
+include/assert.inc [gtid_purged is the same as before the crash]
+# The server takes new writes after recovery.
+INSERT INTO t1 VALUES (4, 'after recovery');
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+5
+DROP TABLE t1, t2, t3;
+SET GLOBAL snapshot_archive = ON;

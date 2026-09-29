@@ -2131,7 +2131,7 @@ index 5d3e0b8b..02d84957 100644
  /**
    Prints a printf style message to the error log.
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
-index c8a7d00b..f97c6752 100644
+index c8a7d00b..71bffbdc 100644
 --- a/sql/mysqld.cc
 +++ b/sql/mysqld.cc
 @@ -774,15 +774,19 @@ MySQL clients support the protocol:
@@ -2494,7 +2494,33 @@ index c8a7d00b..f97c6752 100644
    /*
     The subsequent calls may take a long time : e.g. innodb log read.
     Thus set the long running service control manager timeout
-@@ -8030,6 +8265,12 @@ int mysqld_main(int argc, char **argv)
+@@ -7935,6 +8170,25 @@ int mysqld_main(int argc, char **argv)
+             true /*is_server_starting*/))
+       unireg_abort(MYSQLD_ABORT_EXIT);
+ 
++#ifdef WESQL
++    /*
++      After a crash recovery from the object store, the binlog reaches past
++      the snapshot the engines were restored to. The transactions in between
++      are replayed later (replay_binlog_after_snapshot()), so their GTIDs must
++      not count as executed yet, or the applier would skip them.
++    */
++    if (opt_serverless && consistent_recovery.binlog_replay_pending()) {
++      Gtid_set replay_gtids(global_sid_map, global_sid_lock);
++      if (consistent_recovery.scan_binlog_replay_window(&replay_gtids))
++        unireg_abort(MYSQLD_ABORT_EXIT);
++      if (!replay_gtids.is_empty()) {
++        global_sid_lock->wrlock();
++        gtids_in_binlog.remove_gtid_set(&replay_gtids);
++        global_sid_lock->unlock();
++      }
++    }
++#endif
++
+     global_sid_lock->wrlock();
+ 
+     purged_gtids_from_binlog.dbug_print("purged_gtids_from_binlog");
+@@ -8030,6 +8284,12 @@ int mysqld_main(int argc, char **argv)
      (void)RUN_HOOK(server_state, after_engine_recovery, (nullptr));
    }
  
@@ -2507,10 +2533,20 @@ index c8a7d00b..f97c6752 100644
    if (init_ssl_communication()) unireg_abort(MYSQLD_ABORT_EXIT);
    if (network_init()) unireg_abort(MYSQLD_ABORT_EXIT);
  
-@@ -8167,6 +8408,13 @@ int mysqld_main(int argc, char **argv)
+@@ -8167,6 +8427,23 @@ int mysqld_main(int argc, char **argv)
  
    (void)RUN_HOOK(server_state, after_recovery, (nullptr));
  
++#ifdef WESQL
++  // Apply the binlog written after the restored snapshot. This must finish
++  // before the archive threads start and before clients are served.
++  if (!opt_initialize && opt_serverless &&
++      consistent_recovery.replay_binlog_after_snapshot()) {
++    LogErr(ERROR_LEVEL, ER_CONSISTENT_SNAPSHOT_LOG,
++           "Failed to replay the binlog written after the snapshot");
++    unireg_abort(MYSQLD_ABORT_EXIT);
++  }
++#endif
 +  // Start binlog and consistent snapshot threads after engine recovery.
 +  if (!opt_initialize) {
 +    // start binlog archive and consistent snapshot archive.
@@ -2521,7 +2557,7 @@ index c8a7d00b..f97c6752 100644
    if (Events::init(opt_noacl || opt_initialize))
      unireg_abort(MYSQLD_ABORT_EXIT);
  
-@@ -8190,6 +8438,12 @@ int mysqld_main(int argc, char **argv)
+@@ -8190,6 +8467,12 @@ int mysqld_main(int argc, char **argv)
      return 1;
    }
  
@@ -2534,7 +2570,7 @@ index c8a7d00b..f97c6752 100644
    /*
      Invoke the bootstrap thread, if required.
    */
-@@ -9308,6 +9562,11 @@ struct my_option my_long_options[] = {
+@@ -9308,6 +9591,11 @@ struct my_option my_long_options[] = {
       &opt_upgrade_mode, &opt_upgrade_mode, &upgrade_mode_typelib, GET_ENUM,
       REQUIRED_ARG, UPGRADE_AUTO, 0, 0, nullptr, 0, nullptr},
  
@@ -2546,7 +2582,7 @@ index c8a7d00b..f97c6752 100644
      {nullptr, 0, nullptr, nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG, 0, 0,
       0, nullptr, 0, nullptr}};
  
-@@ -9317,6 +9576,26 @@ static int show_queries(THD *thd, SHOW_VAR *var, char *) {
+@@ -9317,6 +9605,26 @@ static int show_queries(THD *thd, SHOW_VAR *var, char *) {
    return 0;
  }
  
@@ -2573,7 +2609,7 @@ index c8a7d00b..f97c6752 100644
  static int show_net_compression(THD *thd, SHOW_VAR *var, char *buff) {
    var->type = SHOW_MY_BOOL;
    var->value = buff;
-@@ -10017,6 +10296,10 @@ SHOW_VAR status_vars[] = {
+@@ -10017,6 +10325,10 @@ SHOW_VAR status_vars[] = {
      {"Threads_running", (char *)&show_num_thread_running, SHOW_FUNC,
       SHOW_SCOPE_GLOBAL},
      {"Uptime", (char *)&show_starttime, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
@@ -2584,7 +2620,7 @@ index c8a7d00b..f97c6752 100644
  #ifdef ENABLED_PROFILING
      {"Uptime_since_flush_status", (char *)&show_flushstatustime, SHOW_FUNC,
       SHOW_SCOPE_GLOBAL},
-@@ -11249,6 +11532,11 @@ static void set_server_version(void) {
+@@ -11249,6 +11561,11 @@ static void set_server_version(void) {
  #ifndef NDEBUG
    if (!strstr(MYSQL_SERVER_SUFFIX_STR, "-debug"))
      end = my_stpcpy(end, "-debug");
@@ -2596,7 +2632,7 @@ index c8a7d00b..f97c6752 100644
  #endif
  #ifdef HAVE_VALGRIND
    if (SERVER_VERSION_LENGTH - (end - server_version) >
-@@ -11948,7 +12236,7 @@ static PSI_mutex_info all_server_mutexes[]=
+@@ -11948,7 +12265,7 @@ static PSI_mutex_info all_server_mutexes[]=
    { &key_monitor_info_run_lock, "Source_IO_monitor::run_lock", 0, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_delegate_connection_mutex, "LOCK_delegate_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_group_replication_connection_mutex, "LOCK_group_replication_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
@@ -2680,7 +2716,7 @@ index 249f2d64..bb52f27d 100644
    Server mutex locks and condition variables.
   */
 diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
-index ed98ac10..98608fb2 100644
+index ed98ac10..34a46d34 100644
 --- a/sql/parse_tree_nodes.cc
 +++ b/sql/parse_tree_nodes.cc
 @@ -78,6 +78,9 @@
@@ -2693,13 +2729,19 @@ index ed98ac10..98608fb2 100644
  #include "sql/sql_data_change.h"
  #include "sql/sql_delete.h"  // Sql_cmd_delete...
  #include "sql/sql_do.h"      // Sql_cmd_do...
-@@ -2027,8 +2030,30 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
+@@ -2027,8 +2030,36 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
  
    pc->create_info->used_fields |= HA_CREATE_USED_ENGINE;
    const bool is_temp_table = pc->create_info->options & HA_LEX_CREATE_TMP_TABLE;
 +#ifdef WITH_SMARTENGINE
 +  LEX_CSTRING actual_engine = engine;
-+  const bool is_system_thd = pc->thd->is_system_thread();
++  /*
++    Replication appliers, including the binlog replay after an object store
++    recovery, get the same substitution as client sessions: the binlog holds
++    the statement as the client wrote it, not the engine it ended up with.
++  */
++  const bool is_system_thd =
++      pc->thd->is_system_thread() && !pc->thd->slave_thread;
 +  const bool use_smartengine = (engine.length == strlen(SMARTENGINE_NAME)) &&
 +      (0 == strncasecmp(engine.str, SMARTENGINE_NAME, engine.length));
 +  if (opt_serverless && !is_system_thd && !is_temp_table && !use_smartengine
