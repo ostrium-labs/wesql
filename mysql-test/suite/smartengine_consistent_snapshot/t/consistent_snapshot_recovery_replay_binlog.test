@@ -19,6 +19,11 @@ let $wait_condition= SELECT count(*) >= 2 FROM INFORMATION_SCHEMA.SNAPSHOT_PERSI
 --let $wait_timeout= 600
 --source include/wait_condition_or_abort.inc
 SET GLOBAL snapshot_archive = OFF;
+# A snapshot that is already running must finish before the writes below,
+# or it could capture them and the replay would have nothing to do.
+let $wait_condition= SELECT PERSISTENT_PROGRESS IN ('END', 'NONE') FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_TASK_INFO;
+--let $wait_timeout= 600
+--source include/wait_condition_or_abort.inc
 --let $snapshots= `SELECT count(*) FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX`
 
 --echo # Commit after the last snapshot, across a binlog rotation.

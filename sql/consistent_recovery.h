@@ -40,6 +40,8 @@ class Master_info;
 class THD;
 
 #define CONSISTENT_SNAPSHOT_RECOVERY_FILE "#status_snapshot_recovery"
+// Present while the binlog written after the snapshot has not been replayed.
+#define CONSISTENT_BINLOG_REPLAY_FILE "#status_binlog_replay"
 #define CONSISTENT_SNAPSHOT_RECOVERY_STAGE_NONE 0
 #define CONSISTENT_SNAPSHOT_RECOVERY_STAGE_BEGIN 1
 #define CONSISTENT_SNAPSHOT_RECOVERY_STAGE_DATA_READY 2
@@ -119,6 +121,9 @@ class Consistent_recovery {
  private:
   int queue_binlog_replay_events(Master_info *mi);
   void remove_recovery_status_file();
+  static std::string binlog_replay_marker_name();
+  static bool write_binlog_replay_marker();
+  static void remove_binlog_replay_marker();
   int init_objstore_in_initialize();
   int init_objstore_in_recovery();
   int init_consistent_snapshot_recovery_context();

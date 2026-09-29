@@ -462,6 +462,16 @@ int Consistent_recovery::recovery_consistent_snapshot(int flags) {
   if ((read_consistent_snapshot_recovery_status(recovery_status) == 0) &&
       (recovery_status.m_recovery_status >=
        CONSISTENT_SNAPSHOT_RECOVERY_STAGE_DATA_READY)) {
+    if (std::ifstream(binlog_replay_marker_name()).good()) {
+      // The replay of the binlog written after the snapshot did not finish
+      // (crash or failure). The engines hold an unknown part of it, and the
+      // replay cannot resume, so do not serve a partly recovered instance.
+      LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+             "The replay of the binlog written after the snapshot was "
+             "interrupted. Remove the data directory to recover again from "
+             "the object store.");
+      return 1;
+    }
     LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
            "Recovery data exists already, skip pull data from object store.");
     m_state = CONSISTENT_RECOVERY_STATE_END;
@@ -477,6 +487,7 @@ int Consistent_recovery::recovery_consistent_snapshot(int flags) {
     return 0;
   }
 
+  remove_binlog_replay_marker();
   memset(&recovery_status, 0, sizeof(recovery_status));
   recovery_status.m_recovery_status = CONSISTENT_SNAPSHOT_RECOVERY_STAGE_BEGIN;
   if (write_consistent_snapshot_recovery_status(recovery_status)) {
@@ -1434,6 +1445,7 @@ bool Consistent_recovery::recovery_binlog(const char *binlog_index_name
       !m_binlog_replay_files.empty() &&
       (m_binlog_replay_files.size() > 1 ||
        m_binlog_replay_end_pos > m_binlog_replay_start_pos)) {
+    if (write_binlog_replay_marker()) return 1;
     m_binlog_replay_pending = true;
     std::string msg("binlog after the snapshot must be replayed, from ");
     msg.append(m_binlog_replay_files.front());
@@ -1787,8 +1799,9 @@ int Consistent_recovery::consistent_snapshot_consensus_recovery_finish() {
                "recovey snapshot binlog mismatch old archive end binlog.");
       }
     }
-    // Keep the status file until the binlog replay has finished, so that a
-    // crash during the replay restarts the recovery from the snapshot.
+    // Keep the status file until the binlog replay has finished. The
+    // #status_binlog_replay marker makes a restart after an interrupted
+    // replay fail instead of serving a partly recovered instance.
     if (m_binlog_replay_pending) {
       LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
              "recover persistent snapshot finish, binlog replay pending");
@@ -2646,6 +2659,30 @@ static inline const char *rpl_make_log_name(PSI_memory_key key, const char *opt,
 
 static constexpr const char *kBinlogReplayChannel = "wesql_snapshot_replay";
 
+std::string Consistent_recovery::binlog_replay_marker_name() {
+  std::string file_name;
+  convert_dirname(mysql_real_data_home, mysql_real_data_home, NullS);
+  file_name.assign(mysql_real_data_home);
+  file_name.append(CONSISTENT_BINLOG_REPLAY_FILE);
+  return file_name;
+}
+
+bool Consistent_recovery::write_binlog_replay_marker() {
+  std::ofstream marker(binlog_replay_marker_name());
+  marker << "binlog replay pending\n";
+  marker.flush();
+  if (!marker.good()) {
+    LogErr(ERROR_LEVEL, ER_CONSISTENT_RECOVERY_LOG,
+           "Failed to write the binlog replay marker file.");
+    return true;
+  }
+  return false;
+}
+
+void Consistent_recovery::remove_binlog_replay_marker() {
+  remove_file(binlog_replay_marker_name());
+}
+
 void Consistent_recovery::remove_recovery_status_file() {
   std::string file_name;
   convert_dirname(mysql_real_data_home, mysql_real_data_home, NullS);
@@ -2667,7 +2704,9 @@ static bool is_group_end_event(Log_event *ev) {
       std::string q(qev->query, qev->q_len);
       std::transform(q.begin(), q.end(), q.begin(), ::toupper);
       return q != "BEGIN" && q.rfind("XA START", 0) != 0 &&
-             q.rfind("XA END", 0) != 0;
+             q.rfind("XA END", 0) != 0 && q.rfind("SAVEPOINT", 0) != 0 &&
+             q.rfind("ROLLBACK TO", 0) != 0 &&
+             q.rfind("RELEASE SAVEPOINT", 0) != 0;
     }
     default:
       return false;
@@ -2731,6 +2770,7 @@ int Consistent_recovery::scan_binlog_replay_window(Gtid_set *gtids) {
   LogErr(SYSTEM_LEVEL, ER_CONSISTENT_RECOVERY_LOG, msg.c_str());
   if (m_binlog_replay_transactions == 0) {
     m_binlog_replay_pending = false;
+    remove_binlog_replay_marker();
     remove_recovery_status_file();
   } else if (gtids != nullptr && !gtids->is_empty()) {
     m_binlog_replay_gtids = new Gtid_set(global_sid_map, global_sid_lock);
@@ -3049,6 +3089,7 @@ int Consistent_recovery::replay_binlog_after_snapshot() {
   m_binlog_replay_pending = false;
   delete m_binlog_replay_gtids;
   m_binlog_replay_gtids = nullptr;
+  remove_binlog_replay_marker();
   remove_recovery_status_file();
   return 0;
 }
