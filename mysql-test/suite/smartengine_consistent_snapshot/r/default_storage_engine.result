@@ -108,4 +108,4 @@ WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't1';
 ENGINE
 SMARTENGINE
 DROP TABLE t1;
-include/assert_grep.inc [Engine substitution is logged]
+Engine substitutions logged by this test: 3

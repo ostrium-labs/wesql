@@ -1,3 +1,12 @@
+--perl
+my $n = 0;
+if (open(my $f, "<", "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err")) {
+  while (<$f>) { $n++ if /WeSQL serverless: connection [0-9]+ asked for ENGINE=INNODB; the table uses SMARTENGINE instead/; }
+}
+open(my $o, ">", "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt") or die;
+print $o "$n\n";
+close $o;
+EOF
 --disable_warnings
 DROP TABLE IF EXISTS t1;
 --enable_warnings
@@ -78,11 +87,15 @@ SELECT ENGINE FROM information_schema.TABLES
 DROP TABLE t1;
 
 ## Substitutions are also written to the error log.
---let $assert_text = Engine substitution is logged
---let $assert_file = $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select = WeSQL serverless: connection [0-9]+ asked for ENGINE=INNODB; the table uses SMARTENGINE instead
---let $assert_count = 3
---source include/assert_grep.inc
+--perl
+my $base = 0;
+if (open(my $b, "<", "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt")) { $base = <$b> + 0; close $b; }
+my $n = 0;
+open(my $f, "<", "$ENV{MYSQLTEST_VARDIR}/log/mysqld.1.err") or die;
+while (<$f>) { $n++ if /WeSQL serverless: connection [0-9]+ asked for ENGINE=INNODB; the table uses SMARTENGINE instead/; }
+unlink "$ENV{MYSQL_TMP_DIR}/engine_subst_base.txt";
+print "Engine substitutions logged by this test: ", $n - $base, "\n";
+EOF
 
 --source suite/smartengine/include/check_smartengine_log_error.inc
 
