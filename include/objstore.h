@@ -239,6 +239,26 @@ int ensure_object_store_lock(const std::string_view &provider,
 
 void destroy_object_store(ObjectStore *obj_store);
 
+// Values of the objectstore_use_path_style server option. They control how
+// the S3 client (providers aws, minio and r2) addresses a bucket:
+// virtual-hosted style (http://<bucket>.<endpoint>/<key>) or path style
+// (http://<endpoint>/<bucket>/<key>).
+enum S3PathStyleMode : unsigned long {
+  S3_PATH_STYLE_OFF = 0,  // always virtual-hosted style
+  S3_PATH_STYLE_ON = 1,   // always path style
+  // Path style if WESQL_OBJECTSTORE_FORCE_PATH_STYLE is set to a true value,
+  // virtual-hosted style if it is set to a false value, and otherwise path
+  // style for provider "minio" and virtual-hosted style for the others.
+  S3_PATH_STYLE_AUTO = 2
+};
+
+// Set the addressing mode used by S3 clients created after this call. mysqld
+// calls it once at startup, before any object store is created.
+void set_s3_path_style_mode(unsigned long mode);
+
+// Whether an S3 client for the given provider uses path-style addressing.
+bool s3_use_path_style(const std::string_view &provider);
+
 void init_objstore_provider(const std::string_view &provider);
 
 void cleanup_objstore_provider(ObjectStore *objstore);

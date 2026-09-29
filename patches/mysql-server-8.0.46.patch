@@ -2131,7 +2131,7 @@ index 5d3e0b8b..02d84957 100644
  /**
    Prints a printf style message to the error log.
 diff --git a/sql/mysqld.cc b/sql/mysqld.cc
-index c8a7d00b..7f2f0b6b 100644
+index c8a7d00b..71bffbdc 100644
 --- a/sql/mysqld.cc
 +++ b/sql/mysqld.cc
 @@ -774,15 +774,19 @@ MySQL clients support the protocol:
@@ -2178,7 +2178,7 @@ index c8a7d00b..7f2f0b6b 100644
  long opt_check_table_funs = CHECK_TABLE_FUN_ABORT;
  bool opt_initialize = false;
  bool opt_skip_replica_start = false;  ///< If set, slave is not autostarted
-@@ -1504,6 +1514,68 @@ char server_version[SERVER_VERSION_LENGTH];
+@@ -1504,6 +1514,69 @@ char server_version[SERVER_VERSION_LENGTH];
  const char *mysqld_unix_port;
  char *opt_mysql_tmpdir;
  
@@ -2240,6 +2240,7 @@ index c8a7d00b..7f2f0b6b 100644
 +char *opt_objstore_region;
 +char *opt_objstore_endpoint;
 +bool opt_objstore_use_https = false;
++ulong opt_objstore_use_path_style = objstore::S3_PATH_STYLE_AUTO;
 +char *opt_objstore_bucket;
 +char *opt_repo_objstore_id = nullptr;
 +char *opt_branch_objstore_id = nullptr;
@@ -2247,7 +2248,7 @@ index c8a7d00b..7f2f0b6b 100644
  char *opt_authentication_policy;
  std::vector<std::string> authentication_policy_list;
  /*
-@@ -2373,6 +2445,11 @@ static void close_connections(void) {
+@@ -2373,6 +2446,11 @@ static void close_connections(void) {
    Call_close_conn call_close_conn(true);
    thd_manager->do_for_all_thd(&call_close_conn);
  
@@ -2259,7 +2260,7 @@ index c8a7d00b..7f2f0b6b 100644
    (void)RUN_HOOK(server_state, after_server_shutdown, (nullptr));
  
    /*
-@@ -2504,6 +2581,9 @@ void clean_up_mysqld_mutexes() { clean_up_mutexes(); }
+@@ -2504,6 +2582,9 @@ void clean_up_mysqld_mutexes() { clean_up_mutexes(); }
  static void mysqld_exit(int exit_code) {
    assert((exit_code >= MYSQLD_SUCCESS_EXIT && exit_code <= MYSQLD_ABORT_EXIT) ||
           exit_code == MYSQLD_RESTART_EXIT);
@@ -2269,7 +2270,7 @@ index c8a7d00b..7f2f0b6b 100644
    mysql_audit_finalize();
    Srv_session::module_deinit();
    delete_optimizer_cost_module();
-@@ -4523,6 +4603,12 @@ SHOW_VAR com_status_vars[] = {
+@@ -4523,6 +4604,12 @@ SHOW_VAR com_status_vars[] = {
      {"xa_start",
       (char *)offsetof(System_status_var, com_stat[(uint)SQLCOM_XA_START]),
       SHOW_LONG_STATUS, SHOW_SCOPE_ALL},
@@ -2282,7 +2283,7 @@ index c8a7d00b..7f2f0b6b 100644
      {NullS, NullS, SHOW_LONG, SHOW_SCOPE_ALL}};
  
  LEX_CSTRING sql_statement_names[(uint)SQLCOM_END + 1];
-@@ -4842,6 +4928,9 @@ int init_common_variables() {
+@@ -4842,6 +4929,9 @@ int init_common_variables() {
    */
    mysql_bin_log.init_pthread_objects();
  
@@ -2292,7 +2293,7 @@ index c8a7d00b..7f2f0b6b 100644
    /* TODO: remove this when my_time_t is 64 bit compatible */
    if (!is_time_t_valid_for_timestamp(server_start_time)) {
      LogErr(ERROR_LEVEL, ER_UNSUPPORTED_DATE);
-@@ -4884,6 +4973,12 @@ int init_common_variables() {
+@@ -4884,6 +4974,12 @@ int init_common_variables() {
    default_storage_engine = "InnoDB";
    default_tmp_storage_engine = default_storage_engine;
  
@@ -2305,7 +2306,7 @@ index c8a7d00b..7f2f0b6b 100644
    /*
      Add server status variables to the dynamic list of
      status variables that is shown by SHOW STATUS.
-@@ -6313,6 +6408,14 @@ static int init_server_components() {
+@@ -6313,6 +6409,14 @@ static int init_server_components() {
        opt_bin_logname = my_strdup(key_memory_opt_bin_logname, buf, MYF(0));
      }
  
@@ -2320,7 +2321,7 @@ index c8a7d00b..7f2f0b6b 100644
      /*
        Skip opening the index file if we start with --help. This is necessary
        to avoid creating the file in an otherwise empty datadir, which will
-@@ -6530,6 +6633,32 @@ static int init_server_components() {
+@@ -6530,6 +6634,32 @@ static int init_server_components() {
        LogErr(ERROR_LEVEL, ER_CANT_INITIALIZE_BUILTIN_PLUGINS);
      unireg_abort(1);
    }
@@ -2353,7 +2354,7 @@ index c8a7d00b..7f2f0b6b 100644
  
    /*
      Needs to be done before dd::init() which runs DDL commands (for real)
-@@ -6812,6 +6941,26 @@ static int init_server_components() {
+@@ -6812,6 +6942,26 @@ static int init_server_components() {
      unireg_abort(1);
    }
  
@@ -2380,7 +2381,7 @@ index c8a7d00b..7f2f0b6b 100644
    if (opt_initialize) log_output_options = LOG_FILE;
  
    /*
-@@ -6845,6 +6994,19 @@ static int init_server_components() {
+@@ -6845,6 +6995,19 @@ static int init_server_components() {
    /*
      Set the default storage engines
    */
@@ -2400,7 +2401,7 @@ index c8a7d00b..7f2f0b6b 100644
    if (initialize_storage_engine(default_storage_engine, "",
                                  &global_system_variables.table_plugin))
      unireg_abort(MYSQLD_ABORT_EXIT);
-@@ -7563,6 +7725,10 @@ int mysqld_main(int argc, char **argv)
+@@ -7563,6 +7726,10 @@ int mysqld_main(int argc, char **argv)
    */
    init_server_psi_keys();
  
@@ -2411,7 +2412,7 @@ index c8a7d00b..7f2f0b6b 100644
    /*
      Now that some instrumentation is in place,
      recreate objects which were initialised early,
-@@ -7850,6 +8016,15 @@ int mysqld_main(int argc, char **argv)
+@@ -7850,6 +8017,15 @@ int mysqld_main(int argc, char **argv)
      unireg_abort(exit_state);
    }
  
@@ -2427,10 +2428,14 @@ index c8a7d00b..7f2f0b6b 100644
    /*
     We have enough space for fiddling with the argv, continue
    */
-@@ -7862,6 +8037,61 @@ int mysqld_main(int argc, char **argv)
+@@ -7862,6 +8038,65 @@ int mysqld_main(int argc, char **argv)
      unireg_abort(MYSQLD_ABORT_EXIT); /* purecov: inspected */
    }
  
++  // Choose virtual-hosted-style or path-style addressing for every S3 client
++  // created from here on, including the SmartEngine and archive clients.
++  objstore::set_s3_path_style_mode(opt_objstore_use_path_style);
++
 +  // Check the validity of the UUID using the specified objstore_uuid
 +  if (!is_help_or_validate_option() && opt_serverless &&
 +      opt_repo_objstore_id != nullptr) {
@@ -2489,7 +2494,7 @@ index c8a7d00b..7f2f0b6b 100644
    /*
     The subsequent calls may take a long time : e.g. innodb log read.
     Thus set the long running service control manager timeout
-@@ -7935,6 +8165,25 @@ int mysqld_main(int argc, char **argv)
+@@ -7935,6 +8170,25 @@ int mysqld_main(int argc, char **argv)
              true /*is_server_starting*/))
        unireg_abort(MYSQLD_ABORT_EXIT);
  
@@ -2515,7 +2520,7 @@ index c8a7d00b..7f2f0b6b 100644
      global_sid_lock->wrlock();
  
      purged_gtids_from_binlog.dbug_print("purged_gtids_from_binlog");
-@@ -8030,6 +8279,12 @@ int mysqld_main(int argc, char **argv)
+@@ -8030,6 +8284,12 @@ int mysqld_main(int argc, char **argv)
      (void)RUN_HOOK(server_state, after_engine_recovery, (nullptr));
    }
  
@@ -2528,7 +2533,7 @@ index c8a7d00b..7f2f0b6b 100644
    if (init_ssl_communication()) unireg_abort(MYSQLD_ABORT_EXIT);
    if (network_init()) unireg_abort(MYSQLD_ABORT_EXIT);
  
-@@ -8167,6 +8422,23 @@ int mysqld_main(int argc, char **argv)
+@@ -8167,6 +8427,23 @@ int mysqld_main(int argc, char **argv)
  
    (void)RUN_HOOK(server_state, after_recovery, (nullptr));
  
@@ -2552,7 +2557,7 @@ index c8a7d00b..7f2f0b6b 100644
    if (Events::init(opt_noacl || opt_initialize))
      unireg_abort(MYSQLD_ABORT_EXIT);
  
-@@ -8190,6 +8462,12 @@ int mysqld_main(int argc, char **argv)
+@@ -8190,6 +8467,12 @@ int mysqld_main(int argc, char **argv)
      return 1;
    }
  
@@ -2565,7 +2570,7 @@ index c8a7d00b..7f2f0b6b 100644
    /*
      Invoke the bootstrap thread, if required.
    */
-@@ -9308,6 +9586,11 @@ struct my_option my_long_options[] = {
+@@ -9308,6 +9591,11 @@ struct my_option my_long_options[] = {
       &opt_upgrade_mode, &opt_upgrade_mode, &upgrade_mode_typelib, GET_ENUM,
       REQUIRED_ARG, UPGRADE_AUTO, 0, 0, nullptr, 0, nullptr},
  
@@ -2577,7 +2582,45 @@ index c8a7d00b..7f2f0b6b 100644
      {nullptr, 0, nullptr, nullptr, nullptr, nullptr, GET_NO_ARG, NO_ARG, 0, 0,
       0, nullptr, 0, nullptr}};
  
-@@ -11249,6 +11532,11 @@ static void set_server_version(void) {
+@@ -9317,6 +9605,26 @@ static int show_queries(THD *thd, SHOW_VAR *var, char *) {
+   return 0;
+ }
+ 
++#ifdef WESQL
++/*
++  Wesql_ready_for_write: ON when client writes are accepted and, when the
++  binlog archive is expected to run (serverless, log_bin and binlog_archive
++  all ON), the thread that ships committed binlog to the object store is
++  running. Object store recovery finishes before mysqld serves any client
++  connection, so a session that can read this variable is past recovery.
++  Readiness probes should wait for ON.
++*/
++static int show_wesql_ready_for_write(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_MY_BOOL;
++  var->value = buff;
++  bool ready = mysqld_server_started && !opt_readonly && !opt_super_readonly;
++  if (ready && opt_serverless && opt_bin_log && opt_binlog_archive)
++    ready = Binlog_archive::get_instance()->is_thread_running();
++  *(reinterpret_cast<bool *>(buff)) = ready;
++  return 0;
++}
++#endif
++
+ static int show_net_compression(THD *thd, SHOW_VAR *var, char *buff) {
+   var->type = SHOW_MY_BOOL;
+   var->value = buff;
+@@ -10017,6 +10325,10 @@ SHOW_VAR status_vars[] = {
+     {"Threads_running", (char *)&show_num_thread_running, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
+     {"Uptime", (char *)&show_starttime, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++#ifdef WESQL
++    {"Wesql_ready_for_write", (char *)&show_wesql_ready_for_write, SHOW_FUNC,
++     SHOW_SCOPE_GLOBAL},
++#endif
+ #ifdef ENABLED_PROFILING
+     {"Uptime_since_flush_status", (char *)&show_flushstatustime, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
+@@ -11249,6 +11561,11 @@ static void set_server_version(void) {
  #ifndef NDEBUG
    if (!strstr(MYSQL_SERVER_SUFFIX_STR, "-debug"))
      end = my_stpcpy(end, "-debug");
@@ -2589,7 +2632,7 @@ index c8a7d00b..7f2f0b6b 100644
  #endif
  #ifdef HAVE_VALGRIND
    if (SERVER_VERSION_LENGTH - (end - server_version) >
-@@ -11948,7 +12236,7 @@ static PSI_mutex_info all_server_mutexes[]=
+@@ -11948,7 +12265,7 @@ static PSI_mutex_info all_server_mutexes[]=
    { &key_monitor_info_run_lock, "Source_IO_monitor::run_lock", 0, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_delegate_connection_mutex, "LOCK_delegate_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
    { &key_LOCK_group_replication_connection_mutex, "LOCK_group_replication_connection_mutex", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
@@ -2599,7 +2642,7 @@ index c8a7d00b..7f2f0b6b 100644
  };
  /* clang-format on */
 diff --git a/sql/mysqld.h b/sql/mysqld.h
-index 249f2d64..3000b5f2 100644
+index 249f2d64..bb52f27d 100644
 --- a/sql/mysqld.h
 +++ b/sql/mysqld.h
 @@ -181,6 +181,9 @@ extern MYSQL_PLUGIN_IMPORT std::atomic<int32>
@@ -2612,7 +2655,7 @@ index 249f2d64..3000b5f2 100644
  extern long opt_check_table_funs;
  extern bool opt_initialize;
  extern bool opt_safe_user_create;
-@@ -701,6 +704,58 @@ extern MYSQL_PLUGIN_IMPORT char pidfile_name[];
+@@ -701,6 +704,59 @@ extern MYSQL_PLUGIN_IMPORT char pidfile_name[];
  
  #define mysql_tmpdir (my_tmpdir(&mysql_tmpdir_list))
  
@@ -2667,15 +2710,26 @@ index 249f2d64..3000b5f2 100644
 +extern MYSQL_PLUGIN_IMPORT char *opt_objstore_region;
 +extern MYSQL_PLUGIN_IMPORT char *opt_objstore_endpoint;
 +extern MYSQL_PLUGIN_IMPORT bool opt_objstore_use_https;
++extern MYSQL_PLUGIN_IMPORT ulong opt_objstore_use_path_style;
 +extern MYSQL_PLUGIN_IMPORT char *opt_objstore_bucket;
  /*
    Server mutex locks and condition variables.
   */
 diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
-index ed98ac10..adeca0f6 100644
+index ed98ac10..34a46d34 100644
 --- a/sql/parse_tree_nodes.cc
 +++ b/sql/parse_tree_nodes.cc
-@@ -2027,8 +2027,29 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
+@@ -78,6 +78,9 @@
+ #include "sql/sql_cmd_ddl_table.h"
+ #include "sql/sql_component.h"  // Sql_cmd_component
+ #include "sql/sql_const.h"
++#ifdef WESQL
++#include "sql/wesql_ddl_compat.h"
++#endif
+ #include "sql/sql_data_change.h"
+ #include "sql/sql_delete.h"  // Sql_cmd_delete...
+ #include "sql/sql_do.h"      // Sql_cmd_do...
+@@ -2027,8 +2030,36 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
  
    pc->create_info->used_fields |= HA_CREATE_USED_ENGINE;
    const bool is_temp_table = pc->create_info->options & HA_LEX_CREATE_TMP_TABLE;
@@ -2690,11 +2744,18 @@ index ed98ac10..adeca0f6 100644
 +      pc->thd->is_system_thread() && !pc->thd->slave_thread;
 +  const bool use_smartengine = (engine.length == strlen(SMARTENGINE_NAME)) &&
 +      (0 == strncasecmp(engine.str, SMARTENGINE_NAME, engine.length));
-+  if (opt_serverless && !is_system_thd && !is_temp_table && !use_smartengine) {
++  if (opt_serverless && !is_system_thd && !is_temp_table && !use_smartengine
++#ifdef WESQL
++      && !wesql_serverless_keeps_engine(engine)
++#endif
++  ) {
 +    actual_engine.str = SMARTENGINE_NAME;
 +    actual_engine.length = strlen(SMARTENGINE_NAME);
 +    push_warning_printf(pc->thd, Sql_condition::SL_WARNING, ER_FORCE_STORAGE_ENGINE_TO_SMARTENGINE,
 +                        "Force change storage engine from %s to smartengine in serveless mode", engine.str);
++#ifdef WESQL
++    wesql_log_engine_substitution(pc->thd, engine);
++#endif
 +  }
 +  return resolve_engine(pc->thd, actual_engine, is_temp_table, false,
 +                        &pc->create_info->db_type);
@@ -4153,10 +4214,10 @@ index 2cd68bb4..d5e1f567 100644
          ;
  
 diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
-index a9a53ef6..40d16f9b 100644
+index a9a53ef6..4473772d 100644
 --- a/sql/sys_vars.cc
 +++ b/sql/sys_vars.cc
-@@ -94,11 +94,13 @@
+@@ -94,11 +94,16 @@
  #include "sql/auth/auth_acls.h"
  #include "sql/auth/auth_common.h"  // validate_user_plugins
  #include "sql/binlog.h"            // mysql_bin_log
@@ -4167,10 +4228,13 @@ index a9a53ef6..40d16f9b 100644
  #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
  #include "sql/conn_handler/socket_connection.h"  // MY_BIND_ALL_ADDRESSES
 +#include "sql/consistent_archive.h" // Consistent_archive
++#ifdef WESQL
++#include "sql/wesql_ddl_compat.h"  // opt_serverless_honor_innodb_engine
++#endif
  #include "sql/derror.h"                          // read_texts
  #include "sql/discrete_interval.h"
  #include "sql/events.h"          // Events
-@@ -153,6 +155,9 @@
+@@ -153,6 +158,9 @@
  #include "storage/perfschema/terminology_use_previous.h"
  #endif /* WITH_PERFSCHEMA_STORAGE_ENGINE */
  
@@ -4180,7 +4244,7 @@ index a9a53ef6..40d16f9b 100644
  static constexpr const unsigned long DEFAULT_ERROR_COUNT{1024};
  static constexpr const unsigned long DEFAULT_SORT_MEMORY{256UL * 1024UL};
  static constexpr const unsigned HOST_CACHE_SIZE{128};
-@@ -2788,6 +2793,9 @@ static Sys_var_ulong Sys_log_throttle_queries_not_using_indexes(
+@@ -2788,6 +2796,9 @@ static Sys_var_ulong Sys_log_throttle_queries_not_using_indexes(
      ON_UPDATE(update_log_throttle_queries_not_using_indexes));
  
  static bool update_log_error_verbosity(sys_var *, THD *, enum_var_type) {
@@ -4190,7 +4254,7 @@ index a9a53ef6..40d16f9b 100644
    return (log_builtins_filter_update_verbosity(log_error_verbosity) < 0);
  }
  
-@@ -7543,6 +7551,13 @@ static Sys_var_charptr Sys_protocol_compression_algorithms(
+@@ -7543,6 +7554,13 @@ static Sys_var_charptr Sys_protocol_compression_algorithms(
      DEFAULT(const_cast<char *>(PROTOCOL_COMPRESSION_DEFAULT_VALUE)),
      NO_MUTEX_GUARD, NOT_IN_BINLOG,
      ON_CHECK(check_set_protocol_compression_algorithms), ON_UPDATE(nullptr));
@@ -4204,7 +4268,7 @@ index a9a53ef6..40d16f9b 100644
  
  static bool check_set_require_row_format(sys_var *, THD *thd, set_var *var) {
    /*
-@@ -7729,3 +7744,268 @@ static Sys_var_enum Sys_explain_format(
+@@ -7729,3 +7747,295 @@ static Sys_var_enum Sys_explain_format(
      SESSION_VAR(explain_format), CMD_LINE(OPT_ARG), explain_format_names,
      DEFAULT(static_cast<ulong>(Explain_format_type::TRADITIONAL)),
      NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
@@ -4411,6 +4475,18 @@ index a9a53ef6..40d16f9b 100644
 +    "serverless", "Enable the serverless",
 +    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_serverless),
 +    CMD_LINE(OPT_ARG), DEFAULT(true));
++#ifdef WESQL
++static Sys_var_bool Sys_serverless_honor_innodb_engine(
++    "serverless_honor_innodb_engine",
++    "In serverless mode, keep user tables created or altered with an "
++    "explicit ENGINE=InnoDB on InnoDB, where foreign keys are enforced, "
++    "instead of moving them to SMARTENGINE. InnoDB tables are not stored "
++    "in the object store table by table: they are copied into each "
++    "consistent snapshot. Tables without an ENGINE clause still use "
++    "SMARTENGINE. Default OFF.",
++    GLOBAL_VAR(opt_serverless_honor_innodb_engine), CMD_LINE(OPT_ARG),
++    DEFAULT(false));
++#endif
 +static Sys_var_bool Sys_table_on_objstore(
 +    "table_on_objectstore", "Use object store to store data in SmartEngine",
 +    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_table_on_objstore), CMD_LINE(OPT_ARG),
@@ -4446,6 +4522,21 @@ index a9a53ef6..40d16f9b 100644
 +    "Whether using https to connect to object store or not.",
 +    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_objstore_use_https), CMD_LINE(OPT_ARG),
 +    DEFAULT(false));
++static const char *objstore_use_path_style_names[] = {"OFF", "ON", "AUTO",
++                                                      NullS};
++static Sys_var_enum Sys_objstore_use_path_style(
++    "objectstore_use_path_style",
++    "How the S3 client (objectstore_provider aws, minio or r2) addresses "
++    "a bucket. ON uses path-style requests (<endpoint>/<bucket>/<key>), "
++    "which MinIO, RustFS and Ceph RGW deployments usually need. OFF uses "
++    "virtual-hosted-style requests (<bucket>.<endpoint>/<key>). AUTO, the "
++    "default, follows the WESQL_OBJECTSTORE_FORCE_PATH_STYLE environment "
++    "variable when it is set to 1/ON/TRUE or 0/OFF/FALSE, and otherwise uses "
++    "path style for objectstore_provider=minio and virtual-hosted style for "
++    "the other providers.",
++    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_objstore_use_path_style),
++    CMD_LINE(REQUIRED_ARG), objstore_use_path_style_names,
++    DEFAULT(objstore::S3_PATH_STYLE_AUTO));
 +static Sys_var_charptr Sys_objstore_bucket(
 +    "objectstore_bucket",
 +    "The object store bucket to store record. "

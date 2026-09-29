@@ -1,0 +1,26 @@
+# Default is AUTO.
+SELECT @@global.objectstore_use_path_style;
+@@global.objectstore_use_path_style
+AUTO
+SELECT @@session.objectstore_use_path_style;
+ERROR HY000: Variable 'objectstore_use_path_style' is a GLOBAL variable
+SET GLOBAL objectstore_use_path_style = ON;
+ERROR HY000: Variable 'objectstore_use_path_style' is a read only variable
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM performance_schema.global_variables
+WHERE VARIABLE_NAME = 'objectstore_use_path_style';
+VARIABLE_NAME	VARIABLE_VALUE
+objectstore_use_path_style	AUTO
+# The option accepts ON, OFF and AUTO on the command line.
+# restart: --objectstore-use-path-style=ON
+SELECT @@global.objectstore_use_path_style;
+@@global.objectstore_use_path_style
+ON
+# restart: --objectstore-use-path-style=OFF
+SELECT @@global.objectstore_use_path_style;
+@@global.objectstore_use_path_style
+OFF
+# restart:
+SELECT @@global.objectstore_use_path_style;
+@@global.objectstore_use_path_style
+AUTO

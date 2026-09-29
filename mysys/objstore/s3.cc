@@ -20,6 +20,7 @@
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/s3/S3Client.h>
+#include <aws/s3/S3ClientConfiguration.h>
 #include <aws/s3/model/CreateBucketRequest.h>
 #include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
@@ -29,7 +30,10 @@
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/PutObjectRequest.h>
 #include <errno.h>
+#include <atomic>
 #include <cassert>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -79,7 +83,79 @@ Errors aws_error_to_objstore_error(const Aws::S3::S3Error &aws_error) {
   }
 }
 
+// curl reports a failed host name lookup as CURLE_COULDNT_RESOLVE_HOST, and
+// the SDK turns it into NETWORK_CONNECTION with the message
+// "curlCode: 6, Couldn't resolve host name".
+bool is_host_resolution_error(const Aws::S3::S3Error &err) {
+  if (err.GetErrorType() != Aws::S3::S3Errors::NETWORK_CONNECTION) {
+    return false;
+  }
+  const Aws::String &msg = err.GetMessage();
+  return msg.find("curlCode: 6,") != Aws::String::npos ||
+         msg.find("resolve host") != Aws::String::npos;
+}
+
+std::atomic<unsigned long> s3_path_style_mode{S3_PATH_STYLE_AUTO};
+
+constexpr const char *kForcePathStyleEnv = "WESQL_OBJECTSTORE_FORCE_PATH_STYLE";
+
+// Returns 1 or 0 if the environment variable holds a true or false value,
+// and -1 if it is unset or holds something else.
+int force_path_style_from_env() {
+  const char *value = std::getenv(kForcePathStyleEnv);
+  if (value == nullptr) return -1;
+  std::string v(value);
+  for (char &c : v) c = static_cast<char>(std::tolower(c));
+  if (v == "1" || v == "on" || v == "true" || v == "yes") return 1;
+  if (v == "0" || v == "off" || v == "false" || v == "no") return 0;
+  return -1;
+}
+
 }  // namespace
+
+void set_s3_path_style_mode(unsigned long mode) {
+  if (mode > S3_PATH_STYLE_AUTO) mode = S3_PATH_STYLE_AUTO;
+  s3_path_style_mode.store(mode);
+}
+
+bool s3_use_path_style(const std::string_view &provider) {
+  switch (s3_path_style_mode.load()) {
+    case S3_PATH_STYLE_OFF:
+      return false;
+    case S3_PATH_STYLE_ON:
+      return true;
+    default: {
+      int env = force_path_style_from_env();
+      if (env >= 0) return env == 1;
+      // MinIO, RustFS and Ceph RGW are usually deployed without a wildcard
+      // DNS name per bucket, and they all accept path-style requests.
+      return provider == "minio";
+    }
+  }
+}
+
+bool S3ObjectStore::should_retry(const Aws::S3::S3Error &err) {
+  return err.ShouldRetry() && !is_host_resolution_error(err);
+}
+
+std::string S3ObjectStore::error_message(const Aws::S3::S3Error &err) const {
+  std::string msg(err.GetMessage());
+  if (is_host_resolution_error(err)) {
+    if (use_path_style_) {
+      msg.append(
+          " (hint: check that the host in objectstore_endpoint can be "
+          "resolved)");
+    } else {
+      msg.append(
+          " (hint: the client uses virtual-hosted-style addressing and looks "
+          "up <bucket>.<endpoint host>. S3-compatible stores such as MinIO, "
+          "RustFS or Ceph RGW usually need path-style addressing: set "
+          "objectstore_use_path_style=ON or "
+          "WESQL_OBJECTSTORE_FORCE_PATH_STYLE=1)");
+    }
+  }
+  return msg;
+}
 
 namespace fs = std::filesystem;
 
@@ -100,13 +176,13 @@ Status S3ObjectStore::create_bucket(const std::string_view &bucket) {
     outcome = s3_client_.CreateBucket(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -126,13 +202,13 @@ Status S3ObjectStore::delete_bucket(const std::string_view &bucket) {
     outcome = s3_client_.DeleteBucket(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -167,13 +243,13 @@ Status S3ObjectStore::put_object_from_file(
     outcome = s3_client_.PutObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -242,13 +318,13 @@ Status S3ObjectStore::put_object(const std::string_view &bucket,
     outcome = s3_client_.PutObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -299,13 +375,13 @@ Status S3ObjectStore::put_object(const std::string_view &bucket,
     outcome = s3_client_.PutObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -329,14 +405,14 @@ Status S3ObjectStore::get_object(const std::string_view &bucket,
     outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
 
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -376,14 +452,14 @@ Status S3ObjectStore::get_object(const std::string_view &bucket,
     outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
 
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -427,13 +503,13 @@ Status S3ObjectStore::get_object(const std::string_view &bucket,
     outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -468,13 +544,13 @@ Status S3ObjectStore::get_object_meta(const std::string_view &bucket,
     outcome = s3_client_.HeadObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -507,14 +583,14 @@ Status S3ObjectStore::list_object(const std::string_view &bucket,
     outcome = s3_client_.ListObjectsV2(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
 
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -563,13 +639,13 @@ Status S3ObjectStore::delete_object(const std::string_view &bucket,
     outcome = s3_client_.DeleteObject(request);
     if (!outcome.IsSuccess()) {
       const Aws::S3::S3Error &err = outcome.GetError();
-      bool should_retry = err.ShouldRetry();
+      bool should_retry = S3ObjectStore::should_retry(err);
       if (retry_times-- > 0 && should_retry) {
         continue;
       }
       Errors err_type = aws_error_to_objstore_error(err);
       return Status(err_type, static_cast<int>(err.GetErrorType()),
-                    err.GetMessage());
+                    error_message(err));
     } else {
       break;
     }
@@ -603,13 +679,13 @@ Status S3ObjectStore::delete_objects(
         outcome = s3_client_.DeleteObjects(request);
         if (!outcome.IsSuccess()) {
           const Aws::S3::S3Error &err = outcome.GetError();
-          bool should_retry = err.ShouldRetry();
+          bool should_retry = S3ObjectStore::should_retry(err);
           if (retry_times-- > 0 && should_retry) {
             continue;
           }
           Errors err_type = aws_error_to_objstore_error(err);
           return Status(err_type, static_cast<int>(err.GetErrorType()),
-                        err.GetMessage());
+                        error_message(err));
         } else {
           break;
         }
@@ -656,9 +732,9 @@ char *get_s3_access_secret_key() {
 }
 
 S3ObjectStore *create_s3_objstore_helper(
-    const std::string_view region, const std::string_view *endpoint,
-    char *access_key_id, char *access_secret_key, bool use_https,
-    std::string &err_msg) {
+    const std::string_view provider, const std::string_view region,
+    const std::string_view *endpoint, char *access_key_id,
+    char *access_secret_key, bool use_https, std::string &err_msg) {
   Aws::Client::ClientConfiguration clientConfig;
   clientConfig.region = region;
   if (endpoint != nullptr) {
@@ -667,6 +743,14 @@ S3ObjectStore *create_s3_objstore_helper(
   clientConfig.scheme =
       use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
 
+  // Keep the payload signing policy the SDK used before this option existed
+  // (Never: the payload is sent as UNSIGNED-PAYLOAD), and only choose between
+  // virtual-hosted-style and path-style addressing.
+  const bool use_path_style = s3_use_path_style(provider);
+  Aws::S3::S3ClientConfiguration s3Config(
+      clientConfig, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+      /*iUseVirtualAddressing=*/!use_path_style);
+
   if (access_key_id && access_secret_key) {
     // if both access_key_id and access_secret_key are not empty, we use them to
     // create the client.
@@ -674,8 +758,8 @@ S3ObjectStore *create_s3_objstore_helper(
     Aws::String access_secret_key_str(access_secret_key);
     Aws::Auth::AWSCredentials credentials(access_key_id_str,
                                           access_secret_key_str);
-    Aws::S3::S3Client client(credentials, nullptr, clientConfig);
-    return new S3ObjectStore(region, std::move(client));
+    Aws::S3::S3Client client(credentials, nullptr, s3Config);
+    return new S3ObjectStore(region, std::move(client), use_path_style);
   } else if (access_key_id || access_secret_key) {
     // if one of the access_key_id and access_secret_key is empty, we treat it
     // as an invalid input.
@@ -688,18 +772,19 @@ S3ObjectStore *create_s3_objstore_helper(
     // credentials by default credential provider chain for AWS. see
     // https://github.com/aws/aws-sdk-cpp/blob/main/docs/Credentials_Providers.md
     // for details
-    Aws::S3::S3Client client(clientConfig);
-    return new S3ObjectStore(region, std::move(client));
+    Aws::S3::S3Client client(s3Config);
+    return new S3ObjectStore(region, std::move(client), use_path_style);
   }
 }
 
-S3ObjectStore *create_s3_objstore(const std::string_view region,
+S3ObjectStore *create_s3_objstore(const std::string_view provider,
+                                  const std::string_view region,
                                   const std::string_view *endpoint,
                                   bool use_https, std::string &err_msg) {
   char *access_key_id = get_s3_access_key_id();
   char *access_secret_key = get_s3_access_secret_key();
   S3ObjectStore *s3_objstore =
-      create_s3_objstore_helper(region, endpoint, access_key_id,
+      create_s3_objstore_helper(provider, region, endpoint, access_key_id,
                                 access_secret_key, use_https, err_msg);
   if (!s3_objstore) {
     err_msg = "failed to create s3 object store:" + err_msg;
@@ -707,28 +792,30 @@ S3ObjectStore *create_s3_objstore(const std::string_view region,
   return s3_objstore;
 }
 
-S3ObjectStore *create_source_s3_objstore(const std::string_view region,
+S3ObjectStore *create_source_s3_objstore(const std::string_view provider,
+                                         const std::string_view region,
                                          const std::string_view *endpoint,
                                          bool use_https, std::string &err_msg) {
   char *source_access_key_id = get_src_access_key_id();
   char *source_access_secret_key = get_src_access_secret_key();
   S3ObjectStore *s3_objstore = create_s3_objstore_helper(
-      region, endpoint, source_access_key_id, source_access_secret_key,
-      use_https, err_msg);
+      provider, region, endpoint, source_access_key_id,
+      source_access_secret_key, use_https, err_msg);
   if (!s3_objstore) {
     err_msg = "failed to create source s3 object store:" + err_msg;
   }
   return s3_objstore;
 }
 
-S3ObjectStore *create_dest_s3_objstore(const std::string_view region,
+S3ObjectStore *create_dest_s3_objstore(const std::string_view provider,
+                                       const std::string_view region,
                                        const std::string_view *endpoint,
                                        bool use_https, std::string &err_msg) {
   char *dest_access_key_id = get_dest_access_key_id();
   char *dest_access_secret_key = get_dest_access_secret_key();
-  S3ObjectStore *s3_objstore =
-      create_s3_objstore_helper(region, endpoint, dest_access_key_id,
-                                dest_access_secret_key, use_https, err_msg);
+  S3ObjectStore *s3_objstore = create_s3_objstore_helper(
+      provider, region, endpoint, dest_access_key_id, dest_access_secret_key,
+      use_https, err_msg);
   if (!s3_objstore) {
     err_msg = "failed to create destination s3 object store:" + err_msg;
   }
