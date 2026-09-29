@@ -2636,10 +2636,20 @@ index 249f2d64..3000b5f2 100644
    Server mutex locks and condition variables.
   */
 diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
-index ed98ac10..340c7a28 100644
+index ed98ac10..98608fb2 100644
 --- a/sql/parse_tree_nodes.cc
 +++ b/sql/parse_tree_nodes.cc
-@@ -2027,8 +2027,23 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
+@@ -78,6 +78,9 @@
+ #include "sql/sql_cmd_ddl_table.h"
+ #include "sql/sql_component.h"  // Sql_cmd_component
+ #include "sql/sql_const.h"
++#ifdef WESQL
++#include "sql/wesql_ddl_compat.h"
++#endif
+ #include "sql/sql_data_change.h"
+ #include "sql/sql_delete.h"  // Sql_cmd_delete...
+ #include "sql/sql_do.h"      // Sql_cmd_do...
+@@ -2027,8 +2030,30 @@ bool PT_create_table_engine_option::contextualize(Table_ddl_parse_context *pc) {
  
    pc->create_info->used_fields |= HA_CREATE_USED_ENGINE;
    const bool is_temp_table = pc->create_info->options & HA_LEX_CREATE_TMP_TABLE;
@@ -2648,11 +2658,18 @@ index ed98ac10..340c7a28 100644
 +  const bool is_system_thd = pc->thd->is_system_thread();
 +  const bool use_smartengine = (engine.length == strlen(SMARTENGINE_NAME)) &&
 +      (0 == strncasecmp(engine.str, SMARTENGINE_NAME, engine.length));
-+  if (opt_serverless && !is_system_thd && !is_temp_table && !use_smartengine) {
++  if (opt_serverless && !is_system_thd && !is_temp_table && !use_smartengine
++#ifdef WESQL
++      && !wesql_serverless_keeps_engine(engine)
++#endif
++  ) {
 +    actual_engine.str = SMARTENGINE_NAME;
 +    actual_engine.length = strlen(SMARTENGINE_NAME);
 +    push_warning_printf(pc->thd, Sql_condition::SL_WARNING, ER_FORCE_STORAGE_ENGINE_TO_SMARTENGINE,
 +                        "Force change storage engine from %s to smartengine in serveless mode", engine.str);
++#ifdef WESQL
++    wesql_log_engine_substitution(pc->thd, engine);
++#endif
 +  }
 +  return resolve_engine(pc->thd, actual_engine, is_temp_table, false,
 +                        &pc->create_info->db_type);
@@ -4111,10 +4128,10 @@ index 2cd68bb4..d5e1f567 100644
          ;
  
 diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
-index a9a53ef6..40d16f9b 100644
+index a9a53ef6..59af6ca6 100644
 --- a/sql/sys_vars.cc
 +++ b/sql/sys_vars.cc
-@@ -94,11 +94,13 @@
+@@ -94,11 +94,16 @@
  #include "sql/auth/auth_acls.h"
  #include "sql/auth/auth_common.h"  // validate_user_plugins
  #include "sql/binlog.h"            // mysql_bin_log
@@ -4125,10 +4142,13 @@ index a9a53ef6..40d16f9b 100644
  #include "sql/conn_handler/connection_handler_manager.h"  // Connection_handler_manager
  #include "sql/conn_handler/socket_connection.h"  // MY_BIND_ALL_ADDRESSES
 +#include "sql/consistent_archive.h" // Consistent_archive
++#ifdef WESQL
++#include "sql/wesql_ddl_compat.h"  // opt_serverless_honor_innodb_engine
++#endif
  #include "sql/derror.h"                          // read_texts
  #include "sql/discrete_interval.h"
  #include "sql/events.h"          // Events
-@@ -153,6 +155,9 @@
+@@ -153,6 +158,9 @@
  #include "storage/perfschema/terminology_use_previous.h"
  #endif /* WITH_PERFSCHEMA_STORAGE_ENGINE */
  
@@ -4138,7 +4158,7 @@ index a9a53ef6..40d16f9b 100644
  static constexpr const unsigned long DEFAULT_ERROR_COUNT{1024};
  static constexpr const unsigned long DEFAULT_SORT_MEMORY{256UL * 1024UL};
  static constexpr const unsigned HOST_CACHE_SIZE{128};
-@@ -2788,6 +2793,9 @@ static Sys_var_ulong Sys_log_throttle_queries_not_using_indexes(
+@@ -2788,6 +2796,9 @@ static Sys_var_ulong Sys_log_throttle_queries_not_using_indexes(
      ON_UPDATE(update_log_throttle_queries_not_using_indexes));
  
  static bool update_log_error_verbosity(sys_var *, THD *, enum_var_type) {
@@ -4148,7 +4168,7 @@ index a9a53ef6..40d16f9b 100644
    return (log_builtins_filter_update_verbosity(log_error_verbosity) < 0);
  }
  
-@@ -7543,6 +7551,13 @@ static Sys_var_charptr Sys_protocol_compression_algorithms(
+@@ -7543,6 +7554,13 @@ static Sys_var_charptr Sys_protocol_compression_algorithms(
      DEFAULT(const_cast<char *>(PROTOCOL_COMPRESSION_DEFAULT_VALUE)),
      NO_MUTEX_GUARD, NOT_IN_BINLOG,
      ON_CHECK(check_set_protocol_compression_algorithms), ON_UPDATE(nullptr));
@@ -4162,7 +4182,7 @@ index a9a53ef6..40d16f9b 100644
  
  static bool check_set_require_row_format(sys_var *, THD *thd, set_var *var) {
    /*
-@@ -7729,3 +7744,268 @@ static Sys_var_enum Sys_explain_format(
+@@ -7729,3 +7747,280 @@ static Sys_var_enum Sys_explain_format(
      SESSION_VAR(explain_format), CMD_LINE(OPT_ARG), explain_format_names,
      DEFAULT(static_cast<ulong>(Explain_format_type::TRADITIONAL)),
      NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
@@ -4369,6 +4389,18 @@ index a9a53ef6..40d16f9b 100644
 +    "serverless", "Enable the serverless",
 +    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_serverless),
 +    CMD_LINE(OPT_ARG), DEFAULT(true));
++#ifdef WESQL
++static Sys_var_bool Sys_serverless_honor_innodb_engine(
++    "serverless_honor_innodb_engine",
++    "In serverless mode, keep user tables created or altered with an "
++    "explicit ENGINE=InnoDB on InnoDB, where foreign keys are enforced, "
++    "instead of moving them to SMARTENGINE. InnoDB tables are not stored "
++    "in the object store table by table: they are copied into each "
++    "consistent snapshot. Tables without an ENGINE clause still use "
++    "SMARTENGINE. Default OFF.",
++    GLOBAL_VAR(opt_serverless_honor_innodb_engine), CMD_LINE(OPT_ARG),
++    DEFAULT(false));
++#endif
 +static Sys_var_bool Sys_table_on_objstore(
 +    "table_on_objectstore", "Use object store to store data in SmartEngine",
 +    READ_ONLY NON_PERSIST GLOBAL_VAR(opt_table_on_objstore), CMD_LINE(OPT_ARG),
