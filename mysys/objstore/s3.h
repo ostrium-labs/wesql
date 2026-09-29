@@ -28,8 +28,11 @@ namespace objstore {
 class S3ObjectStore : public ObjectStore {
  public:
   explicit S3ObjectStore(const std::string_view region,
-                         Aws::S3::S3Client &&s3_client)
-      : region_(region), s3_client_(s3_client) {}
+                         Aws::S3::S3Client &&s3_client,
+                         bool use_path_style = false)
+      : region_(region),
+        s3_client_(s3_client),
+        use_path_style_(use_path_style) {}
   virtual ~S3ObjectStore() = default;
 
   Status create_bucket(const std::string_view &bucket) override;
@@ -100,10 +103,20 @@ class S3ObjectStore : public ObjectStore {
   std::string_view get_provider() const override { return provider_; }
 
  private:
+  // Whether to retry a failed request. Retryable SDK errors are retried,
+  // except a failed host name lookup: retrying cannot fix a host name that
+  // does not exist, and it delays startup by minutes.
+  static bool should_retry(const Aws::S3::S3Error &err);
+
+  // The SDK error message, plus a hint on the likely fix when the host name
+  // lookup failed.
+  std::string error_message(const Aws::S3::S3Error &err) const;
+
   static constexpr std::string_view provider_{"aws"};
   static constexpr int kDeleteObjsNumEach = 1000;
   std::string region_;
   Aws::S3::S3Client s3_client_;
+  bool use_path_style_ = false;
   // TODO(ljc): may add an configuration setting
   int retry_times_on_error_ = 10;
 };
@@ -114,15 +127,18 @@ void init_aws_api();
 
 void shutdown_aws_api();
 
-S3ObjectStore *create_s3_objstore(const std::string_view region,
+S3ObjectStore *create_s3_objstore(const std::string_view provider,
+                                  const std::string_view region,
                                   const std::string_view *endpoint,
                                   bool useHttps, std::string &err_msg);
 
-S3ObjectStore *create_source_s3_objstore(const std::string_view region,
+S3ObjectStore *create_source_s3_objstore(const std::string_view provider,
+                                         const std::string_view region,
                                          const std::string_view *endpoint,
                                          bool use_https, std::string &err_msg);
 
-S3ObjectStore *create_dest_s3_objstore(const std::string_view region,
+S3ObjectStore *create_dest_s3_objstore(const std::string_view provider,
+                                       const std::string_view region,
                                        const std::string_view *endpoint,
                                        bool use_https, std::string &err_msg);
 
