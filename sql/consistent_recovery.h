@@ -32,6 +32,13 @@
 #include "mysqld_error.h"
 #include "objstore.h"
 
+#include <string>
+#include <vector>
+
+class Gtid_set;
+class Master_info;
+class THD;
+
 #define CONSISTENT_SNAPSHOT_RECOVERY_FILE "#status_snapshot_recovery"
 #define CONSISTENT_SNAPSHOT_RECOVERY_STAGE_NONE 0
 #define CONSISTENT_SNAPSHOT_RECOVERY_STAGE_BEGIN 1
@@ -81,7 +88,37 @@ class Consistent_recovery {
       Consistent_snapshot_recovery_status &recovery_status);
   int consistent_snapshot_consensus_recovery_finish();
 
+  /*
+    Replay of the binlog written after the snapshot.
+
+    Crash recovery restores the engines to the last consistent snapshot, and
+    restores the binlog up to the last archived slice, which may be well past
+    the snapshot. The transactions in between are committed and archived but
+    are not in the restored engine data, so they have to be applied again
+    before the server takes client traffic.
+  */
+  /** True if restored binlog past the snapshot position must be replayed. */
+  bool binlog_replay_pending() const { return m_binlog_replay_pending; }
+  /**
+    Read the replay window: add the GTIDs of its transactions to gtids and
+    find where its last transaction ends. The caller removes the GTIDs from
+    the executed set, so the applier does not skip them. Clears the pending
+    flag if the window holds no transaction.
+  */
+  int scan_binlog_replay_window(Gtid_set *gtids);
+  /**
+    Apply the restored binlog from the snapshot position to its end with a
+    temporary replication channel, and wait for it to finish. Called once
+    at startup, after replication is initialized and before the archive
+    threads start and clients are served.
+  */
+  int replay_binlog_after_snapshot();
+  /** Body of replay_binlog_after_snapshot(), run in its own thread. */
+  int run_binlog_replay(THD *thd);
+
  private:
+  int queue_binlog_replay_events(Master_info *mi);
+  void remove_recovery_status_file();
   int init_objstore_in_initialize();
   int init_objstore_in_recovery();
   int init_consistent_snapshot_recovery_context();
@@ -160,6 +197,20 @@ class Consistent_recovery {
   char m_mysql_binlog_index_file_name[FN_REFLEN + 1];
   char m_consistent_snapshot_local_time
       [iso8601_size];  // MAX_DATETIME_FULL_WIDTH
+
+  // Binlog replay window: from (first file, m_binlog_replay_start_pos) to
+  // (last file, m_binlog_replay_end_pos). Full paths of the local binlog
+  // files, in order.
+  bool m_binlog_replay_pending;
+  std::vector<std::string> m_binlog_replay_files;
+  my_off_t m_binlog_replay_start_pos;
+  my_off_t m_binlog_replay_end_pos;
+  // End of the last transaction in the window: the applier stops there.
+  std::string m_binlog_replay_until_file;
+  my_off_t m_binlog_replay_until_pos;
+  uint64_t m_binlog_replay_transactions;
+  // GTIDs of the replayed transactions (empty with gtid_mode=OFF).
+  Gtid_set *m_binlog_replay_gtids;
 };
 
 extern Consistent_recovery consistent_recovery;

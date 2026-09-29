@@ -1,0 +1,88 @@
+#
+# Transactions committed after the last snapshot, whose binlog is already in
+# the object store, must survive a crash and a recovery into an empty data
+# directory (upstream issue wesql/wesql#95).
+#
+# Uses kill -9 rather than a debug crash point, so it also runs on release
+# builds. This variant runs with gtid_mode=ON: the replayed transactions keep
+# their GTIDs, and gtid_executed and gtid_purged are the same as before the
+# crash.
+#
+
+--echo # Turn on GTIDs.
+SET GLOBAL enforce_gtid_consistency = ON;
+SET GLOBAL gtid_mode = OFF_PERMISSIVE;
+SET GLOBAL gtid_mode = ON_PERMISSIVE;
+SET GLOBAL gtid_mode = ON;
+
+--echo # Wait for a snapshot taken after GTIDs are on, then stop taking snapshots.
+--let $snapshots_before= `SELECT count(*) FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX`
+CREATE TABLE t1 (id INT PRIMARY KEY, v VARCHAR(32)) ENGINE=SMARTENGINE;
+INSERT INTO t1 VALUES (1, 'in snapshot');
+
+let $wait_condition= SELECT count(*) >= $snapshots_before + 1 FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX;
+--let $wait_timeout= 600
+--source include/wait_condition_or_abort.inc
+# A snapshot only starts when the binlog has changed, so this one starts
+# after everything above is committed.
+INSERT INTO t1 VALUES (0, 'in snapshot');
+let $wait_condition= SELECT count(*) >= $snapshots_before + 2 FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX;
+--source include/wait_condition_or_abort.inc
+SET GLOBAL snapshot_archive = OFF;
+--let $snapshots= `SELECT count(*) FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX`
+
+--echo # Commit after the last snapshot, across a binlog rotation.
+INSERT INTO t1 VALUES (2, 'after snapshot');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'after snapshot, new binlog');
+UPDATE t1 SET v = 'updated after snapshot' WHERE id = 1;
+CREATE TABLE t2 (id INT PRIMARY KEY) ENGINE=SMARTENGINE;
+INSERT INTO t2 VALUES (1), (2);
+--echo # An explicit ENGINE=InnoDB is replaced by SMARTENGINE, also on replay.
+CREATE TABLE t3 (id INT PRIMARY KEY) ENGINE=InnoDB;
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't3';
+SELECT * FROM t1 ORDER BY id;
+
+--echo # Wait until that binlog is in the object store.
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--let $binlog_pos= query_get_value(SHOW MASTER STATUS, Position, 1)
+let $wait_condition= SELECT SUBSTRING_INDEX(LAST_PERSISTED_MYSQL_BINLOG, '/', -1) = '$binlog_file' AND LAST_PERSISTED_MYSQL_BINLOG_POS >= $binlog_pos FROM INFORMATION_SCHEMA.BINLOG_PERSISTENT_TASK_INFO;
+--let $wait_timeout= 600
+--source include/wait_condition_or_abort.inc
+
+--disable_query_log
+--eval SELECT count(*) = $snapshots AS no_new_snapshot FROM INFORMATION_SCHEMA.SNAPSHOT_PERSISTENT_SNAPSHOT_INDEX
+--enable_query_log
+
+--let $gtid_executed_before= `SELECT @@global.gtid_executed`
+--let $gtid_purged_before= `SELECT @@global.gtid_purged`
+
+--let $MYSQLD_DATADIR= `SELECT @@datadir`
+--echo # Kill the server and remove its data directory.
+--source include/kill_mysqld.inc
+--force-rmdir $MYSQLD_DATADIR
+--mkdir $MYSQLD_DATADIR
+
+--echo # Recover from the object store.
+--let $restart_parameters= restart: --gtid-mode=ON --enforce-gtid-consistency=ON
+--source include/start_mysqld.inc
+
+SELECT * FROM t1 ORDER BY id;
+SELECT * FROM t2 ORDER BY id;
+SELECT ENGINE FROM information_schema.TABLES
+  WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 't3';
+
+--let $assert_text= gtid_executed is the same as before the crash
+--let $assert_cond= "[SELECT @@global.gtid_executed]" = "$gtid_executed_before"
+--source include/assert.inc
+--let $assert_text= gtid_purged is the same as before the crash
+--let $assert_cond= "[SELECT @@global.gtid_purged]" = "$gtid_purged_before"
+--source include/assert.inc
+
+--echo # The server takes new writes after recovery.
+INSERT INTO t1 VALUES (4, 'after recovery');
+SELECT COUNT(*) FROM t1;
+
+DROP TABLE t1, t2, t3;
+SET GLOBAL snapshot_archive = ON;
